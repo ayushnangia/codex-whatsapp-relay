@@ -443,6 +443,15 @@ from their connector metadata on the first run:
 npm run confirmations -- on --slack-app-id YOUR_SLACK_APP_ID --gmail-app-id YOUR_GMAIL_APP_ID
 ```
 
+Separately named Codex MCP connections using the exact official Slack endpoint
+`https://mcp.slack.com/mcp` are also discovered automatically, including when
+Slack is the only configured service. Run `on` again after adding connections.
+The same toggle covers final sends in all discovered connections while keeping
+their existing enabled/disabled states and OAuth configuration intact. This
+does not authorize new Slack workspaces or implement a hosted account picker;
+each independent organization still needs its own OAuth authorization. Turning
+the toggle off restores the prior policy, including any user-owned prompts.
+
 Slack sends, scheduled messages, edits to posted messages, and final file sharing
 are covered; Gmail send, send-draft, and forwarding are covered. Slack upload-URL preparation, draft creation/editing, and known relay read/prepare tools receive explicit
 approval overrides so they do not prompt; other operations keep their existing policy. This uses native host approval controls, not

@@ -65,6 +65,15 @@ def build_targets(config, slack_id=None, gmail_id=None):
             add(server + ['tools', tool, 'approval_mode'], 'prompt')
         for tool in ['whatsapp_prepare_media', 'whatsapp_read_messages', 'whatsapp_list_chats', 'whatsapp_auth_status', 'whatsapp_message_status', 'whatsapp_sync_history']:
             add(server + ['tools', tool, 'approval_mode'], 'approve')
+    slack_servers = [
+        ['mcp_servers', name] for name, server in config.get('mcp_servers', {}).items()
+        if server.get('url') == 'https://mcp.slack.com/mcp'
+    ]
+    for server in slack_servers:
+        for tool in ['slack_send_message', 'slack_schedule_message', 'slack_edit_message', 'slack_complete_file_upload']:
+            add(server + ['tools', tool, 'approval_mode'], 'prompt')
+        for tool in ['slack_send_message_draft', 'slack_get_file_upload_url']:
+            add(server + ['tools', tool, 'approval_mode'], 'approve')
     for app_id, tools in [(slack_id, ['slack_send_message', 'slack_schedule_message', 'slack_edit_message', 'slack_complete_file_upload']),
                           (gmail_id, ['send_email', 'send_draft', 'forward_emails'])]:
         if not app_id:
@@ -75,8 +84,8 @@ def build_targets(config, slack_id=None, gmail_id=None):
         drafts = ['slack_send_message_draft', 'slack_get_file_upload_url'] if app_id == slack_id else ['create_draft', 'update_draft']
         for tool in drafts:
             add(['apps', app_id, 'tools', tool, 'approval_mode'], 'approve')
-    if not servers and not slack_id and not gmail_id:
-        raise ValueError('No configured WhatsApp Relay found. Supply connected Slack/Gmail app IDs if desired.')
+    if not servers and not slack_servers and not slack_id and not gmail_id:
+        raise ValueError('No configured WhatsApp Relay or official Slack MCP found. Supply connected Slack/Gmail app IDs if desired.')
     return targets
 
 

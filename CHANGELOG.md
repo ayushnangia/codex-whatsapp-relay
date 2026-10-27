@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Apply the optional final-send confirmation toggle to separately named official Slack MCP connections, without changing their authentication or enabled state.
+
 ### Added
 
 - Optional connector-reply skill with a tested, network-free Gmail argument builder and saved-draft validator for native thread linkage and clean MIME content.

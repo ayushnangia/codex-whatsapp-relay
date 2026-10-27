@@ -8,6 +8,35 @@ import { fileURLToPath } from "node:url";
 
 const script = fileURLToPath(new URL("send-confirmations.py", import.meta.url));
 const pythonAvailable = spawnSync("python3", ["-c", "import tomllib"]).status === 0;
+
+test("one confirmation toggle covers fifteen independent official Slack MCP connections", { skip: !pythonAvailable }, async t => {
+  const profiles = Array.from({ length: 15 }, (_, i) => `slack-org-${i + 1}`);
+  const original = profiles.map(name => `[mcp_servers.${name}]\nurl="https://mcp.slack.com/mcp"\nenabled=false\n`).join("\n")
+    + '\n[mcp_servers.unrelated]\nurl="https://example.test/mcp"\n';
+  const { run, read } = await fixture(t, original);
+  assert.equal(run("on").status, 0);
+  const on = read();
+  for (const name of profiles) {
+    assert.equal(on.mcp_servers[name].enabled, false);
+    for (const tool of ["slack_send_message", "slack_schedule_message", "slack_edit_message", "slack_complete_file_upload"]) {
+      assert.equal(on.mcp_servers[name].tools[tool].approval_mode, "prompt");
+    }
+    assert.equal(on.mcp_servers[name].tools.slack_send_message_draft.approval_mode, "approve");
+    assert.equal(on.mcp_servers[name].tools.slack_get_file_upload_url.approval_mode, "approve");
+  }
+  assert.equal(on.mcp_servers.unrelated.tools, undefined);
+  assert.equal(run("off").status, 0);
+  assert.ok(Object.values(read().mcp_servers).every(server => server.tools === undefined));
+  assert.equal(run("on").status, 0);
+  assert.deepEqual(read(), on);
+});
+
+test("Slack connection confirmation discovery preserves conflicting policies", { skip: !pythonAvailable }, async t => {
+  const original = '[mcp_servers.slack-example]\nurl="https://mcp.slack.com/mcp"\n[mcp_servers.slack-example.tools.slack_send_message]\napproval_mode="approve"\n';
+  const { config, run } = await fixture(t, original);
+  assert.notEqual(run("on").status, 0);
+  assert.equal(await fs.readFile(config, "utf8"), original);
+});
 async function fixture(t, contents) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "wa-confirm-policy-"));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
