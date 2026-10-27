@@ -444,7 +444,7 @@ npm run confirmations -- on --slack-app-id YOUR_SLACK_APP_ID --gmail-app-id YOUR
 ```
 
 Slack sends, scheduled messages, edits to posted messages, and final file sharing
-are covered; Gmail send and send-draft are covered. Draft creation/editing and known relay read/prepare tools receive explicit
+are covered; Gmail send, send-draft, and forwarding are covered. Slack upload-URL preparation, draft creation/editing, and known relay read/prepare tools receive explicit
 approval overrides so they do not prompt; other operations keep their existing policy. This uses native host approval controls, not
 a claim of server-side enforcement by the relay. Managed host policies take
 precedence; loading changes in an existing host depends on its configuration
@@ -456,3 +456,19 @@ The relay adds no ChatGPT signature to outbound content. Slack or another servic
 may still display its own app identity; this setting does not hide platform labels.
 See the [official configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)
 and [plugin server policy](https://developers.openai.com/plugins/build/plugins).
+
+### Clean native reply preparation
+
+The optional `skills/connector-replies` skill provides native reply guidance for
+Gmail and Slack and makes the relay's reply limitations explicit. Install it in
+your Codex skills directory if you use those connectors. Its Python helper only
+prepares native Gmail draft arguments and validates supplied draft readback data;
+it has no credentials or network access and never sends mail.
+
+The helper uses the fetched Gmail message ID as `reply_message_id`, preserves
+the subject and intended recipient, and builds clean HTML/plain-text alternatives
+without copying a `>` quote chain from the parent. It distinguishes a follow-up
+to your own sent message from a reply to another sender. Native draft verification
+checks the actual thread, reply headers, recipients and MIME bodies before a send.
+Local fixture validation alone is not evidence that a hosted connector saved the
+correct draft. The hosted Gmail/Slack implementation is not changed by this skill.

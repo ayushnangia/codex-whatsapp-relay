@@ -25,9 +25,11 @@ test("send confirmations toggle only final-send tools and restore previous confi
   assert.equal(on.approval_policy, "never");
   assert.equal(on.apps._default, undefined);
   assert.equal(on.apps["test-gmail"].tools.send_draft.approval_mode, "prompt");
+  assert.equal(on.apps["test-gmail"].tools.forward_emails.approval_mode, "prompt");
   assert.equal(on.apps["test-gmail"].tools.create_draft.approval_mode, "approve");
   assert.equal(on.apps["test-gmail"].tools.update_draft.approval_mode, "approve");
   assert.equal(on.apps["test-slack"].tools.slack_send_message_draft.approval_mode, "approve");
+  assert.equal(on.apps["test-slack"].tools.slack_get_file_upload_url.approval_mode, "approve");
   assert.equal(on.apps["test-slack"].tools.slack_send_message.approval_mode, "prompt");
   assert.equal(on.apps["test-slack"].approvals_reviewer, "user");
   assert.equal(on.plugins["whatsapp-relay@example"].mcp_servers["whatsapp-relay"].tools.whatsapp_send_media.approval_mode, "prompt");
@@ -58,4 +60,13 @@ test("policy helper preserves a symlinked config target", { skip: !pythonAvailab
   assert.equal(run("on").status, 0);
   assert.ok((await fs.lstat(config)).isSymbolicLink());
   assert.match(await fs.readFile(target, "utf8"), /send-confirmations v1/);
+});
+
+test("turning on a remembered policy picks up newly covered final-send paths", { skip: !pythonAvailable }, async t => {
+  const metadata = { targets: [{ path: ["apps", "test-gmail", "tools", "send_draft", "approval_mode"], value: "prompt" }], enabled: false };
+  const original = '# BEGIN whatsapp-relay send-confirmations v1\n# policy: ' + JSON.stringify(metadata) + '\n# END whatsapp-relay send-confirmations v1\n';
+  const { run, read } = await fixture(t, original);
+  assert.equal(run("on").status, 0);
+  assert.equal(read().apps["test-gmail"].tools.forward_emails.approval_mode, "prompt");
+  assert.equal(read().apps["test-gmail"].tools.create_draft.approval_mode, "approve");
 });

@@ -66,13 +66,13 @@ def build_targets(config, slack_id=None, gmail_id=None):
         for tool in ['whatsapp_prepare_media', 'whatsapp_read_messages', 'whatsapp_list_chats', 'whatsapp_auth_status', 'whatsapp_message_status', 'whatsapp_sync_history']:
             add(server + ['tools', tool, 'approval_mode'], 'approve')
     for app_id, tools in [(slack_id, ['slack_send_message', 'slack_schedule_message', 'slack_edit_message', 'slack_complete_file_upload']),
-                          (gmail_id, ['send_email', 'send_draft'])]:
+                          (gmail_id, ['send_email', 'send_draft', 'forward_emails'])]:
         if not app_id:
             continue
         add(['apps', app_id, 'approvals_reviewer'], 'user')
         for tool in tools:
             add(['apps', app_id, 'tools', tool, 'approval_mode'], 'prompt')
-        drafts = ['slack_send_message_draft'] if app_id == slack_id else ['create_draft', 'update_draft']
+        drafts = ['slack_send_message_draft', 'slack_get_file_upload_url'] if app_id == slack_id else ['create_draft', 'update_draft']
         for tool in drafts:
             add(['apps', app_id, 'tools', tool, 'approval_mode'], 'approve')
     if not servers and not slack_id and not gmail_id:
@@ -97,7 +97,19 @@ def main():
     if args.mode == 'off' and not previous:
         print('Already off; no configuration changed.')
         return
-    targets = previous['targets'] if previous and not args.slack_app_id and not args.gmail_app_id else build_targets(config, args.slack_app_id, args.gmail_app_id)
+    if previous and args.mode == 'off':
+        targets = previous['targets']
+    else:
+        slack_id, gmail_id = args.slack_app_id, args.gmail_app_id
+        if previous and not slack_id and not gmail_id:
+            for target in previous['targets']:
+                keys = target['path']
+                if len(keys) == 5 and keys[0] == 'apps' and keys[2] == 'tools':
+                    if keys[3].startswith('slack_'):
+                        slack_id = keys[1]
+                    elif keys[3] in ['send_email', 'send_draft', 'forward_emails', 'create_draft', 'update_draft']:
+                        gmail_id = keys[1]
+        targets = build_targets(config, slack_id, gmail_id)
     updated = base + ('' if not base or base.endswith('\n') else '\n') + render(targets, args.mode == 'on')
     tomllib.loads(updated)  # Reject conflicting tables before touching user config.
     args.config.parent.mkdir(parents=True, exist_ok=True)

@@ -1,4 +1,5 @@
 node_modules/
+__pycache__/
 plugins/whatsapp-relay/.venv-chatterbox/
 
 # Runtime state, cached messages, media, and QR codes must never be committed.

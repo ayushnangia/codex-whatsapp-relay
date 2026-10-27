@@ -6,11 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Optional connector-reply skill with a tested, network-free Gmail argument builder and saved-draft validator for native thread linkage and clean MIME content.
 - Optional native-host final-send confirmation toggle for WhatsApp, with opt-in Slack/Gmail tool policies; draft/read preparation remains available without prompts and unrelated settings stay unchanged.
 - CI on Node.js 22 and 24 with reproducible dependency installation and checks for every JavaScript source file.
 
 ### Fixed
 
+- Include Gmail forwarding in final-send approval coverage while allowing Slack upload-URL preparation; remembered policies pick up coverage additions when enabled again.
 - Snapshot approved media bytes before connecting/uploading, so later source-file edits cannot change the outgoing attachment.
 - Ignore all runtime data, downloaded media, and pairing QR artifacts in Git.
 - Keep the documented `audio/ogg; codecs=opus` MIME for verified Opus input, reject conflicting codec declarations, and expose audio download preflight without another send.
