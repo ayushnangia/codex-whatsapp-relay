@@ -1,12 +1,41 @@
 import fs from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { jidNormalizedUser, proto } from "@whiskeysockets/baileys";
 
 const DEFAULT_MAX_MESSAGES_PER_CHAT = 200;
+
+function mergeDeliveryStatus(previous, next) {
+  if (next === undefined) return previous;
+  if (previous === undefined || next === proto.WebMessageInfo.Status.ERROR) return next;
+  if (previous === proto.WebMessageInfo.Status.ERROR && next === proto.WebMessageInfo.Status.PENDING) return previous;
+  return Math.max(previous, next);
+}
+
+function receiptEvidence(entry) {
+  const receipts = (entry.rawMessage?.userReceipt ?? []).filter(receipt => receipt.userJid);
+  const count = field => receipts.filter(receipt => normalizeTimestamp(receipt[field]) > 0).length;
+  return { delivered: count("receiptTimestamp"), read: count("readTimestamp"), played: count("playedTimestamp") };
+}
+
+function withReceiptEvidence(entry) {
+  const receipts = receiptEvidence(entry);
+  let status = entry.deliveryStatus;
+  // Group receipts confirm individual participants, not the whole group.
+  if (entry.fromMe && !entry.chatId.endsWith("@g.us")) {
+    const receiptStatus = receipts.played ? proto.WebMessageInfo.Status.PLAYED
+      : receipts.read ? proto.WebMessageInfo.Status.READ
+      : receipts.delivered ? proto.WebMessageInfo.Status.DELIVERY_ACK : undefined;
+    status = mergeDeliveryStatus(status, receiptStatus);
+  }
+  return { ...entry, deliveryStatus: status, receipts };
+}
 
 function emptyStore() {
   return {
     meta: {
       updatedAt: null,
       lastConnection: null,
+      jidAliases: {},
       messageLimitByChat: {}
     },
     chats: {},
@@ -59,6 +88,10 @@ export function unwrapMessage(message) {
     return unwrapMessage(message.viewOnceMessageV2.message);
   }
 
+  if (message.viewOnceMessageV2Extension?.message) {
+    return unwrapMessage(message.viewOnceMessageV2Extension.message);
+  }
+
   if (message.documentWithCaptionMessage?.message) {
     return unwrapMessage(message.documentWithCaptionMessage.message);
   }
@@ -92,6 +125,13 @@ export function extractMessageText(message) {
     return payload.documentMessage.caption;
   }
 
+  if (payload.contactMessage) {
+    return `[contact] ${payload.contactMessage.displayName ?? ""}`.trim();
+  }
+  if (payload.contactsArrayMessage) {
+    return `[contacts] ${(payload.contactsArrayMessage.contacts ?? []).map(c => c.displayName ?? "").filter(Boolean).join(", ")}`;
+  }
+
   if (typeof payload.buttonsResponseMessage?.selectedDisplayText === "string") {
     return payload.buttonsResponseMessage.selectedDisplayText;
   }
@@ -108,7 +148,7 @@ export function extractMessageText(message) {
     return payload.pollCreationMessage.name;
   }
 
-  const firstKey = Object.keys(payload)[0];
+  const firstKey = Object.keys(payload).find(key => key !== "messageContextInfo" && payload[key] != null);
   return firstKey ? `[${firstKey}]` : "";
 }
 
@@ -118,7 +158,7 @@ export function extractMessageType(message) {
     return "unknown";
   }
 
-  return Object.keys(payload)[0] ?? "unknown";
+  return Object.keys(payload).find(key => key !== "messageContextInfo" && payload[key] != null) ?? "unknown";
 }
 
 export function extractAudioMessage(message) {
@@ -147,6 +187,8 @@ export class WhatsAppStore {
     this.filePath = filePath;
     this.data = emptyStore();
     this.pendingSave = null;
+    this.savePromise = Promise.resolve();
+    this.pendingMessageStatuses = new Map();
   }
 
   async load() {
@@ -174,7 +216,19 @@ export class WhatsAppStore {
 
   async save() {
     this.data.meta.updatedAt = new Date().toISOString();
-    await fs.writeFile(this.filePath, JSON.stringify(this.data, null, 2));
+    const snapshot = JSON.stringify(this.data, null, 2);
+    const write = this.savePromise.catch(() => {}).then(async () => {
+      const temporary = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
+      try {
+        await fs.writeFile(temporary, snapshot, { mode: 0o600 });
+        await fs.rename(temporary, this.filePath);
+      } catch (error) {
+        await fs.unlink(temporary).catch(() => {});
+        throw error;
+      }
+    });
+    this.savePromise = write;
+    return write;
   }
 
   scheduleSave() {
@@ -195,6 +249,53 @@ export class WhatsAppStore {
       ...this.data.meta,
       ...partial
     };
+    this.scheduleSave();
+  }
+
+  canonicalJid(jid) {
+    const normalized = jidNormalizedUser(jid ?? "");
+    return this.data.meta.jidAliases?.[normalized] ?? normalized;
+  }
+
+  recordJidMapping({ lid, pn } = {}) {
+    lid = jidNormalizedUser(lid ?? "");
+    pn = jidNormalizedUser(pn ?? "");
+    if (!lid.endsWith("@lid") || !pn.endsWith("@s.whatsapp.net")) return;
+    if (this.data.meta.jidAliases?.[lid] === pn) return;
+    if (this.data.meta.jidAliases?.[lid]) {
+      this.data.meta.jidMappingConflictCount = (this.data.meta.jidMappingConflictCount ?? 0) + 1;
+      this.scheduleSave();
+      return;
+    }
+    this.data.meta.jidAliases = { ...(this.data.meta.jidAliases ?? {}), [lid]: pn };
+    const contact = this.data.contacts[lid];
+    if (contact) {
+      this.data.contacts[pn] = { ...contact, ...this.data.contacts[pn], id: pn, lid, phoneNumber: pn };
+      delete this.data.contacts[lid];
+    }
+    const lidChat = this.data.chats[lid];
+    const pnChat = this.data.chats[pn];
+    if (lidChat || pnChat) {
+      const newest = (lidChat?.lastMessageTimestamp ?? lidChat?.timestamp ?? 0) >
+        (pnChat?.lastMessageTimestamp ?? pnChat?.timestamp ?? 0) ? lidChat : pnChat;
+      this.data.chats[pn] = {
+        ...lidChat, ...pnChat, id: pn,
+        name: pnChat?.name ?? lidChat?.name ?? null,
+        ...(newest ? { lastMessageText: newest.lastMessageText, lastMessageId: newest.lastMessageId, lastMessageType: newest.lastMessageType,
+          lastMessageTimestamp: newest.lastMessageTimestamp, timestamp: newest.timestamp } : {})
+      };
+      delete this.data.chats[lid];
+    }
+    const merged = new Map();
+    for (const message of [...(this.data.messages[lid] ?? []), ...(this.data.messages[pn] ?? [])]) {
+      const previous = merged.get(message.id);
+      merged.set(message.id, { ...previous, ...message, chatId: pn,
+        rawMessage: message.rawMessage ?? previous?.rawMessage,
+        deliveryStatus: mergeDeliveryStatus(previous?.deliveryStatus, message.deliveryStatus) });
+    }
+    this.ensureMessageCapacity(pn, Math.max(this.getMessageLimit(lid), this.getMessageLimit(pn)));
+    this.data.messages[pn] = [...merged.values()].sort((a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0)).slice(-this.getMessageLimit(pn));
+    delete this.data.messages[lid];
     this.scheduleSave();
   }
 
@@ -224,13 +325,17 @@ export class WhatsAppStore {
       return;
     }
 
-    this.data.contacts[contact.id] = {
-      ...(this.data.contacts[contact.id] ?? {}),
-      id: contact.id,
-      name: contact.name ?? this.data.contacts[contact.id]?.name ?? null,
-      notify: contact.notify ?? this.data.contacts[contact.id]?.notify ?? null,
+    this.recordJidMapping({ lid: contact.lid ?? contact.id, pn: contact.phoneNumber ?? contact.id });
+    const id = this.canonicalJid(contact.id);
+    this.data.contacts[id] = {
+      ...(this.data.contacts[id] ?? {}),
+      id,
+      lid: contact.lid ?? (contact.id.endsWith("@lid") ? contact.id : this.data.contacts[id]?.lid),
+      phoneNumber: contact.phoneNumber ?? this.data.contacts[id]?.phoneNumber,
+      name: contact.name ?? this.data.contacts[id]?.name ?? null,
+      notify: contact.notify ?? this.data.contacts[id]?.notify ?? null,
       verifiedName:
-        contact.verifiedName ?? this.data.contacts[contact.id]?.verifiedName ?? null,
+        contact.verifiedName ?? this.data.contacts[id]?.verifiedName ?? null,
       updatedAt: new Date().toISOString()
     };
 
@@ -241,6 +346,8 @@ export class WhatsAppStore {
     if (!chat?.id) {
       return;
     }
+
+    chat = { ...chat, id: this.canonicalJid(chat.id) };
 
     const existing = this.data.chats[chat.id] ?? {};
     const contact = this.data.contacts[chat.id];
@@ -273,6 +380,7 @@ export class WhatsAppStore {
   }
 
   ingestHistory(history = {}) {
+    this.data.meta.lastHistorySyncAt = new Date().toISOString();
     for (const contact of history.contacts ?? []) {
       this.upsertContact(contact);
     }
@@ -289,7 +397,14 @@ export class WhatsAppStore {
   }
 
   ingestMessage(message, { incrementUnread = true } = {}) {
-    const remoteJid = message?.key?.remoteJid;
+    const key = message?.key;
+    if (key?.remoteJidAlt) {
+      this.recordJidMapping({
+        lid: key.remoteJid?.endsWith("@lid") ? key.remoteJid : key.remoteJidAlt,
+        pn: key.remoteJid?.endsWith("@s.whatsapp.net") ? key.remoteJid : key.remoteJidAlt
+      });
+    }
+    const remoteJid = this.canonicalJid(key?.remoteJid);
     if (!remoteJid) {
       return;
     }
@@ -305,15 +420,50 @@ export class WhatsAppStore {
       text: extractMessageText(message.message),
       messageType: extractMessageType(message.message)
     };
+    if (message.status !== undefined) messageEntry.deliveryStatus = message.status;
+    if (message.message) {
+      messageEntry.rawMessage = proto.WebMessageInfo.toObject(proto.WebMessageInfo.fromObject(message), {
+        bytes: String, longs: String
+      });
+      const payload = unwrapMessage(message.message);
+      const media = payload?.imageMessage ?? payload?.videoMessage ?? payload?.audioMessage ?? payload?.documentMessage ?? payload?.stickerMessage;
+      if (media) messageEntry.media = {
+        mimetype: media.mimetype ?? null, fileName: media.fileName ?? null,
+        fileLength: normalizeTimestamp(media.fileLength), seconds: media.seconds ?? null,
+        voiceNote: Boolean(media.ptt)
+      };
+    }
 
     const list = this.data.messages[remoteJid] ?? [];
     const existingIndex = list.findIndex((item) => item.id === messageEntry.id);
+    const pendingKey = `${remoteJid}|${messageEntry.id}`;
+    messageEntry.deliveryStatus = mergeDeliveryStatus(
+      mergeDeliveryStatus(mergeDeliveryStatus(list[existingIndex]?.deliveryStatus, this.pendingMessageStatuses.get(pendingKey)),
+        messageEntry.fromMe ? this.pendingMessageStatuses.get(`*|${messageEntry.id}`) : undefined),
+      messageEntry.deliveryStatus
+    );
+    this.pendingMessageStatuses.delete(pendingKey);
+    if (messageEntry.fromMe) this.pendingMessageStatuses.delete(`*|${messageEntry.id}`);
 
     if (existingIndex >= 0) {
+      if (messageEntry.rawMessage && list[existingIndex].rawMessage?.userReceipt?.length) {
+        const receipts = new Map(list[existingIndex].rawMessage.userReceipt.map(receipt => [receipt.userJid, receipt]));
+        for (const receipt of messageEntry.rawMessage.userReceipt ?? []) {
+          const previous = receipts.get(receipt.userJid) ?? {};
+          const merged = { ...previous, ...receipt };
+          for (const field of ["receiptTimestamp", "readTimestamp", "playedTimestamp"]) {
+            const stamp = Math.max(normalizeTimestamp(previous[field]) ?? 0, normalizeTimestamp(receipt[field]) ?? 0);
+            if (stamp > 0) merged[field] = stamp;
+          }
+          receipts.set(receipt.userJid, merged);
+        }
+        messageEntry.rawMessage.userReceipt = [...receipts.values()];
+      }
       list[existingIndex] = {
         ...list[existingIndex],
         ...messageEntry
       };
+      if (message.message && !messageEntry.media) delete list[existingIndex].media;
     } else {
       list.push(messageEntry);
     }
@@ -344,12 +494,13 @@ export class WhatsAppStore {
       ...(shouldUpdateLastMessage
         ? {
             lastMessageText: messageEntry.text,
+            lastMessageId: messageEntry.id,
             lastMessageType: messageEntry.messageType,
             lastMessageTimestamp: messageEntry.timestamp
           }
         : {}),
       unreadCount:
-        incrementUnread && !messageEntry.fromMe
+        incrementUnread && existingIndex < 0 && !messageEntry.fromMe
           ? (currentChat.unreadCount ?? 0) + 1
           : currentChat.unreadCount ?? 0,
       updatedAt: new Date().toISOString()
@@ -397,15 +548,82 @@ export class WhatsAppStore {
   }
 
   getMessages(chatId, limit = 20) {
+    chatId = this.canonicalJid(chatId);
     const messages = this.data.messages[chatId] ?? [];
-    return messages.slice(-limit).sort((a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0));
+    return messages.slice(-limit).sort((a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0)).map(withReceiptEvidence);
   }
 
   getMessageCount(chatId) {
+    chatId = this.canonicalJid(chatId);
     return (this.data.messages[chatId] ?? []).length;
   }
 
+  getRawMessage(chatId, messageId) {
+    const entry = (this.data.messages[this.canonicalJid(chatId)] ?? []).find(message => message.id === messageId);
+    return entry?.rawMessage ? proto.WebMessageInfo.fromObject(entry.rawMessage) : null;
+  }
+
+  updateMessage(key, update = {}) {
+    // A self-device receipt can omit recipient; server ACKs can use the service
+    // JID. Resolve only a unique outgoing ID, never an incoming message ID.
+    const unaddressedOwn = key?.fromMe === true && (!key.remoteJid || key.remoteJid === "s.whatsapp.net");
+    if (unaddressedOwn) {
+      const matches = Object.values(this.data.messages).flatMap(messages => messages.filter(message => message.fromMe && message.id === key.id));
+      if (matches.length > 1) return;
+      if (matches.length === 1) key = { ...key, remoteJid: matches[0].chatId };
+    }
+    const list = this.data.messages[this.canonicalJid(key?.remoteJid)] ?? [];
+    const entry = list.find(message => message.id === key?.id);
+    if (!entry) {
+      // A provider acknowledgement can beat sendMessage's asynchronous return.
+      if (key?.id && (key.remoteJid || unaddressedOwn) && update.status !== undefined) {
+        const pendingKey = `${unaddressedOwn ? "*" : this.canonicalJid(key.remoteJid)}|${key.id}`;
+        this.pendingMessageStatuses.set(pendingKey, mergeDeliveryStatus(this.pendingMessageStatuses.get(pendingKey), update.status));
+        if (this.pendingMessageStatuses.size > 1000) this.pendingMessageStatuses.delete(this.pendingMessageStatuses.keys().next().value);
+      }
+      return;
+    }
+    if (update.message === null || update.messageStubType === proto.WebMessageInfo.StubType.REVOKE) {
+      entry.text = "[deleted]";
+      entry.messageType = "revoked";
+      delete entry.rawMessage;
+      delete entry.media;
+    } else if (update.message && entry.rawMessage) {
+      const raw = this.getRawMessage(key.remoteJid, key.id);
+      this.ingestMessage({ ...raw, ...update, key: raw.key }, { incrementUnread: false });
+    }
+    const updated = (this.data.messages[this.canonicalJid(key.remoteJid)] ?? []).find(message => message.id === key.id);
+    if (update.status !== undefined) {
+      updated.deliveryStatus = mergeDeliveryStatus(updated.deliveryStatus, update.status);
+      if (updated.rawMessage) updated.rawMessage.status = updated.deliveryStatus;
+    }
+    const chat = this.data.chats[this.canonicalJid(key.remoteJid)];
+    if (chat && (chat.lastMessageId === key.id ||
+        (!chat.lastMessageId && list.at(-1)?.id === key.id && (chat.lastMessageTimestamp ?? 0) <= (updated.timestamp ?? 0)))) {
+      chat.lastMessageId = updated.id;
+      chat.lastMessageText = updated.text;
+      chat.lastMessageType = updated.messageType;
+    }
+    this.scheduleSave();
+  }
+
+  updateReceipt(key, receipt) {
+    const raw = this.getRawMessage(key?.remoteJid, key?.id);
+    if (!raw || !receipt?.userJid) return;
+    const previous = raw.userReceipt ?? [];
+    const index = previous.findIndex(item => this.canonicalJid(item.userJid) === this.canonicalJid(receipt.userJid));
+    const merged = { ...(previous[index] ?? {}), userJid: receipt.userJid };
+    for (const field of ["receiptTimestamp", "readTimestamp", "playedTimestamp"]) {
+      const stamp = normalizeTimestamp(receipt[field]);
+      if (stamp > 0) merged[field] = Math.max(normalizeTimestamp(merged[field]) ?? 0, stamp);
+    }
+    if (index < 0) previous.push(merged); else previous[index] = merged;
+    raw.userReceipt = previous;
+    this.ingestMessage(raw, { incrementUnread: false });
+  }
+
   getOldestMessage(chatId) {
+    chatId = this.canonicalJid(chatId);
     const messages = this.data.messages[chatId] ?? [];
     if (!messages.length) {
       return null;
@@ -416,6 +634,7 @@ export class WhatsAppStore {
 
   resolveChat({ chatId, chatName }) {
     if (chatId) {
+      chatId = this.canonicalJid(chatId);
       const exact = this.data.chats[chatId];
       if (exact) {
         return {
@@ -438,8 +657,8 @@ export class WhatsAppStore {
       };
     }
 
-    const candidates = this.listChats({ limit: 50, query });
-    const exact = candidates.find((chat) => {
+    const candidates = this.listChats({ limit: Number.MAX_SAFE_INTEGER, query });
+    const exact = candidates.filter((chat) => {
       const names = [
         chat.id,
         chat.displayName,
@@ -453,12 +672,14 @@ export class WhatsAppStore {
       return names.includes(query);
     });
 
-    if (exact) {
+    if (exact.length === 1) {
       return {
-        match: exact,
+        match: exact[0],
         candidates
       };
     }
+
+    if (exact.length > 1) return { match: null, candidates: exact };
 
     return {
       match: candidates.length === 1 ? candidates[0] : null,

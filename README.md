@@ -367,6 +367,48 @@ npm run whatsapp:tts:smoke -- --provider chatterbox-turbo --language-id es --tex
 
 The Chatterbox path is slower than `say` because the Python process and model are loaded locally for each generated reply. It is now the preferred provider. English uses Turbo, while supported non-English replies route through the multilingual model. If you prefer the lighter macOS voice path everywhere, set `WHATSAPP_RELAY_TTS_PROVIDER=system`. If you only want the macOS fallback for non-English replies, set `WHATSAPP_RELAY_TTS_CHATTERBOX_ALLOW_NON_ENGLISH=0`. On machines where Perth's native implicit watermarker is unavailable, the helper falls back to Perth's dummy watermarker so local synthesis still works.
 
+## MCP media, history and receipts
+
+The local MCP server now includes `whatsapp_prepare_media`, `whatsapp_send_media`,
+`whatsapp_download_media`, and `whatsapp_message_status`. Prepare a local file
+first, review its absolute path, SHA-256 and caption, then send with that hash
+as `expectedSha256`. Supported types are image, video, audio, document and WebP
+sticker. Voice notes require an Ogg Opus file. The relay caps a single file at
+100 MiB. Media preparation does not upload or send a message.
+
+Message reads expose IDs and cached media metadata. Downloads require a retained
+raw message envelope; older cache entries may lack one. Downloaded files stay
+under the private runtime data directory, small images return inline previews,
+and view-once media is excluded. A submitted message ID does not prove delivery;
+`whatsapp_message_status` reports only the acknowledgements the cache received.
+
+The existing `whatsapp_send_message` tool also accepts a `media` object with the
+same fields as `whatsapp_send_media`; leave `text` empty for media and use
+`media.caption` where applicable. The existing `whatsapp_read_messages` tool can
+select an exact `messageId`; with `downloadMedia: true` it downloads that media.
+These options use the same native MCP connection when a host caches older tool
+names. No text command or encoded-message workaround is used.
+
+On supported Node.js versions, SIGHUP flushes the cache and replaces only the
+MCP worker with `process.execve`, retaining its stdio connection. Tool-list-change
+notifications announce the updated schema. This does not restart Codex or other
+MCP workers. Use only for an explicitly authorized, identified WhatsApp worker.
+Wait for in-flight tool calls to finish first; unfinished calls are not replayed.
+
+Read results explicitly report `source: local_cache` and unverified history
+completeness. Phone/LID mappings are merged, but neither an active socket nor a
+successful cached read establishes that all latest phone history has arrived.
+History refresh records its stanza ID in a private metadata journal before
+dispatch. `whatsapp_sync_history` accepts `statusOnly: true` and an optional
+`requestId` to check late responses without contacting the phone again. A timeout
+keeps the original request unresolved; the same anchor is not automatically
+retried. Only a response with the matching session ID confirms that request.
+Message reads expose actual receipt counts. A server ACK confirms server receipt;
+it does not establish delivery to the recipient's phone or audio playback.
+`npm install` reapplies the reviewed pairing and pre-login acknowledgement
+backports to the pinned Baileys rc14 dependency. Review `scripts/patch-baileys.mjs`
+before changing the Baileys version. These fixes are reapplied on every install of the pinned dependency.
+
 ## CLI Fallback
 
 If you need to test outside Codex:
@@ -376,3 +418,41 @@ npm run whatsapp:auth
 npm run whatsapp:controller
 npm run whatsapp:status
 ```
+
+### Optional final-send confirmations
+
+Codex supports per-tool approval policies. Enable confirmation for the relay's
+text/media send tools without prompting for reads or media preparation:
+
+```bash
+npm run confirmations -- on
+npm run confirmations -- status
+npm run confirmations -- off
+```
+
+This optional helper requires Python 3.11+ and edits only its managed block in
+`$CODEX_HOME/config.toml` (normally `~/.codex/config.toml`). Off removes the helper's
+policy overrides; it does not grant permissions or disable other safeguards.
+On restores the same selected tools. Existing conflicting policies are left
+untouched and require manual reconciliation. No messages are sent by the helper.
+
+To include connected Slack and Gmail final-send tools, supply the actual app IDs
+from their connector metadata on the first run:
+
+```bash
+npm run confirmations -- on --slack-app-id YOUR_SLACK_APP_ID --gmail-app-id YOUR_GMAIL_APP_ID
+```
+
+Slack sends, scheduled messages, edits to posted messages, and final file sharing
+are covered; Gmail send and send-draft are covered. Draft creation/editing and known relay read/prepare tools receive explicit
+approval overrides so they do not prompt; other operations keep their existing policy. This uses native host approval controls, not
+a claim of server-side enforcement by the relay. Managed host policies take
+precedence; loading changes in an existing host depends on its configuration
+refresh support. Do not restart another session or job to apply these settings.
+The controller is a separate autonomous sender and is not gated by MCP tool
+approvals; keep it disabled unless explicitly authorized.
+
+The relay adds no ChatGPT signature to outbound content. Slack or another service
+may still display its own app identity; this setting does not hide platform labels.
+See the [official configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)
+and [plugin server policy](https://developers.openai.com/plugins/build/plugins).

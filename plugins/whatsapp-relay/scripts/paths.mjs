@@ -5,9 +5,12 @@ import { fileURLToPath } from "node:url";
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 export const pluginRoot = path.resolve(scriptDir, "..");
 export const repoRoot = path.resolve(pluginRoot, "..", "..");
-export const dataDir = path.join(pluginRoot, "data");
+export const dataDir = process.env.WHATSAPP_DATA_DIR
+  ? path.resolve(process.env.WHATSAPP_DATA_DIR)
+  : path.join(pluginRoot, "data");
 export const authDir = path.join(dataDir, "auth");
 export const storeFile = path.join(dataDir, "store.json");
+export const historyRequestsFile = path.join(dataDir, "history-requests.json");
 export const runtimeFile = path.join(dataDir, "runtime.json");
 export const credsFile = path.join(authDir, "creds.json");
 export const controllerConfigFile = path.join(dataDir, "controller-config.json");

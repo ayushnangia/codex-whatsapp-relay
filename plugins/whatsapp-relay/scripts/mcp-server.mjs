@@ -1,6 +1,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import fs from "node:fs/promises";
+import { proto } from "@whiskeysockets/baileys";
+import { prepareMedia, freezePreparedMedia, downloadMessageMedia } from "./media.mjs";
+import { unwrapMessage } from "./store.mjs";
 
 import { ControllerConfigStore } from "./controller-config.mjs";
 import {
@@ -41,7 +45,9 @@ function messageSummary(message) {
     ? new Date(message.timestamp * 1000).toISOString()
     : "unknown-time";
   const author = message.fromMe ? "me" : message.pushName || message.participant || "contact";
-  return `- [${stamp}] ${author}: ${message.text || `[${message.messageType}]`}`;
+  const media = message.media ? ` media=${message.media.mimetype ?? message.messageType} file=${message.media.fileName ?? "unnamed"} voice_note=${message.media.voiceNote} duration_seconds=${message.media.seconds ?? "unknown"}` : "";
+  const receipts = message.receipts ? ` receipt_delivered=${message.receipts.delivered} receipt_read=${message.receipts.read} receipt_played=${message.receipts.played}` : "";
+  return `- [${stamp}] id=${message.id} status=${proto.WebMessageInfo.Status[message.deliveryStatus] ?? "unknown"} ${author}: ${message.text || `[${message.messageType}]`}${media}${receipts}`;
 }
 
 function formatTimestamp(value) {
@@ -183,6 +189,16 @@ function resolveChatOrError({ chatId, chatName }) {
   );
 }
 
+function resolveSendChatOrError({ chatId, chatName }) {
+  if (chatId && !runtime.store.resolveChat({ chatId }).match) {
+    if (!/^(?:\d{7,15}@s\.whatsapp\.net|\d+@lid|\d+(?:-\d+)?@g\.us)$/.test(chatId)) {
+      throw new Error("An explicit recipient must be a valid WhatsApp chat ID.");
+    }
+    return { id: chatId, displayName: chatId };
+  }
+  return resolveChatOrError({ chatId, chatName });
+}
+
 const server = new McpServer({
   name: "whatsapp-relay",
   version: "0.2.0"
@@ -236,6 +252,12 @@ server.tool(
       `cache_file: ${storeFile}`,
       `recent_chat_count: ${summary.recentChatCount}`
     ];
+    lines.push(`cache_updated_at: ${runtime.store.data.meta.updatedAt ?? "unknown"}`);
+    lines.push(`last_history_sync_at: ${runtime.store.data.meta.lastHistorySyncAt ?? "unknown"}`);
+    lines.push(`last_message_event_at: ${runtime.store.data.meta.lastMessageEventAt ?? "unknown"}`);
+    lines.push("history_completeness: not_verified");
+    lines.push(`pending_notifications_received: ${summary.receivedPendingNotifications ? "yes" : "no"}`);
+    lines.push("features: send_message_media_v1, read_message_media_v1, in_place_reload_v1, history_request_journal_v1, receipt_evidence_v1");
 
     if (summary.user?.id) {
       lines.push(`user: ${summary.user.id}`);
@@ -464,12 +486,13 @@ server.tool(
   },
   async ({ limit = 20, query, unreadOnly = false }) => {
     try {
+      if (runtime.state.status !== "connected") await runtime.store.load();
       const chats = runtime.store.listChats({ limit, query, unreadOnly });
       if (!chats.length) {
         return textResult("No chats matched the requested filter.");
       }
 
-      return textResult(chats.map(chatSummary).join("\n"));
+      return textResult(["source: local_cache", "history_completeness: not_verified", ...chats.map(chatSummary)].join("\n"));
     } catch (error) {
       return textResult(error.message, { isError: true });
     }
@@ -478,23 +501,35 @@ server.tool(
 
 server.tool(
   "whatsapp_read_messages",
-  "Read recent messages from one WhatsApp chat, identified by chat id or name.",
+  "Read cached messages and media metadata from a chat. Reports sync metadata; cached history is not guaranteed to include the latest phone messages.",
   {
     chatId: z.string().min(1).optional(),
     chatName: z.string().min(1).optional(),
-    limit: z.number().int().min(1).max(100).optional()
+    limit: z.number().int().min(1).max(100).optional(),
+    messageId: z.string().min(1).optional(),
+    downloadMedia: z.boolean().optional()
   },
-  async ({ chatId, chatName, limit = 20 }) => {
+  async ({ chatId, chatName, limit = 20, messageId, downloadMedia = false }) => {
     try {
+      if (runtime.state.status !== "connected") await runtime.store.load();
       const chat = resolveChatOrError({ chatId, chatName });
-      const messages = runtime.store.getMessages(chat.id, limit);
+      if (downloadMedia) {
+        if (!messageId) throw new Error("Downloading media requires an exact messageId.");
+        return await downloadCachedMedia(chat, messageId);
+      }
+      const messages = messageId
+        ? runtime.store.getMessages(chat.id, runtime.store.getMessageLimit(chat.id)).filter(message => message.id === messageId)
+        : runtime.store.getMessages(chat.id, limit);
 
       if (!messages.length) {
         return textResult(`No cached messages found for ${chat.displayName}.`);
       }
 
       return textResult(
-        [`chat: ${chat.displayName} (${chat.id})`, ...messages.map(messageSummary)].join("\n")
+        [`chat: ${chat.displayName} (${chat.id})`, "source: local_cache", "history_completeness: not_verified",
+          `connection: ${runtime.state.status}`, `last_history_sync_at: ${runtime.store.data.meta.lastHistorySyncAt ?? "unknown"}`,
+          `last_message_event_at: ${runtime.store.data.meta.lastMessageEventAt ?? "unknown"}`,
+          ...messages.map(messageSummary)].join("\n")
       );
     } catch (error) {
       return textResult(error.message, { isError: true });
@@ -504,34 +539,51 @@ server.tool(
 
 server.tool(
   "whatsapp_sync_history",
-  "Request older messages for a WhatsApp chat and store them in the local cache.",
+  "Request older messages with durable request IDs. Use statusOnly to reconcile delayed responses without another phone request. Unresolved requests at the same anchor are never automatically repeated.",
   {
     chatId: z.string().min(1).optional(),
     chatName: z.string().min(1).optional(),
-    count: z.number().int().min(1).max(50).optional()
+    count: z.number().int().min(1).max(50).optional(),
+    beforeMessageId: z.string().min(1).optional(),
+    statusOnly: z.boolean().optional(),
+    requestId: z.string().min(1).optional()
   },
-  async ({ chatId, chatName, count = 50 }) => {
+  async ({ chatId, chatName, count = 50, beforeMessageId, statusOnly = false, requestId }) => {
     try {
+      if (statusOnly || requestId) {
+        await runtime.historyRequests.load();
+        const canonicalChatId = chatId || chatName ? resolveChatOrError({ chatId, chatName }).id : undefined;
+        return textResult(JSON.stringify({ source: "history_request_journal", new_request_sent: false,
+          requests: runtime.historyRequests.list(canonicalChatId, requestId) }, null, 2));
+      }
       await ensureDirectRuntimeAvailable("History sync");
       const chat = resolveChatOrError({ chatId, chatName });
       const result = await runtime.syncChatHistory({
         chatId: chat.id,
-        count
+        count,
+        beforeMessageId
       });
 
       return textResult(
         [
           `chat: ${chat.displayName} (${chat.id})`,
           `requested: ${count}`,
-          `history_events: ${result.events}`,
-          `messages_received: ${result.messages}`,
+          `history_events: ${result.events ?? 0}`,
+          `messages_received: ${result.messages ?? 0}`,
+          `response_correlation: ${result.sessionMatched ? "matched_session" : "none"}`,
+          `received_message_ids: ${JSON.stringify(result.receivedMessageIds)}`,
           `cache_before: ${result.beforeCount}`,
           `cache_after: ${result.afterCount}`,
+          `anchor_message_id: ${result.anchorMessageId}`,
+          `anchor_timestamp: ${formatTimestamp(result.anchorTimestamp)}`,
           `oldest_before: ${formatTimestamp(result.oldestTimestampBefore)}`,
           `oldest_after: ${formatTimestamp(result.oldestTimestampAfter)}`,
           `retention_limit: ${result.retentionLimit}`,
           `session_id: ${result.sessionId}`,
-          result.timedOut ? "status: partial_sync_timeout" : "status: ok"
+          `reused_previous_request: ${Boolean(result.reused)}`,
+          `request_state: ${result.state}`,
+          ...(result.error ? [`request_error: ${result.error}`] : []),
+          `status: ${result.state === "response_received" ? "ok" : result.state}`
         ].join("\n")
       );
     } catch (error) {
@@ -540,17 +592,69 @@ server.tool(
   }
 );
 
+const mediaInput = {
+  filePath: z.string().min(1),
+  mediaType: z.enum(["image", "video", "audio", "document", "sticker"]),
+  caption: z.string().max(1024).optional(),
+  mimetype: z.string().min(1).optional(),
+  voiceNote: z.boolean().optional(),
+  expectedSha256: z.string().regex(/^[a-f0-9]{64}$/).optional()
+};
+
+async function submitMedia(chat, input) {
+  const media = await prepareMedia(input);
+  const bridge = await getBridgeState();
+  if (bridge.ownsLiveSession) {
+    const command = await enqueueControllerCommand({ type: "send_media", payload: {
+      chatId: chat.id, ...input, filePath: media.filePath, expectedSha256: media.sha256
+    } });
+    return textResult(`status: queued\ncommand_id: ${command.id}\ndelivery: not_yet_verified`);
+  }
+  const frozen = await freezePreparedMedia(media);
+  const socket = await runtime.ensureConnected();
+  const sent = await socket.sendMessage(chat.id, frozen.content);
+  if (!sent?.key?.id) throw new Error("No message ID returned; outcome unknown. Do not automatically retry.");
+  runtime.store.ingestMessage(sent, { incrementUnread: false });
+  return textResult(`status: submitted\nchat: ${chat.displayName} (${chat.id})\nmessage_id: ${sent.key.id}\nsha256: ${media.sha256}\ndelivery: not_yet_verified`);
+}
+
+async function downloadCachedMedia(chat, messageId) {
+  await ensureDirectRuntimeAvailable("Media download");
+  const raw = runtime.store.getRawMessage(chat.id, messageId);
+  const file = await downloadMessageMedia(raw, runtime.socket, { logger: runtime.logger });
+  const content = [{ type: "text", text: `Downloaded media: ${file.path}\nmimetype: ${file.mimetype}\nbytes: ${file.bytes}` }];
+  const audio = unwrapMessage(raw.message)?.audioMessage;
+  if (audio) {
+    try {
+      const prepared = await prepareMedia({ filePath: file.path, mediaType: "audio", voiceNote: Boolean(audio.ptt) });
+      content[0].text += `\naudio_preflight: supported\nnormalized_audio_mimetype: ${prepared.mimetype}\nsha256: ${prepared.sha256}\nnew_message_sent: false`;
+    } catch (error) {
+      content[0].text += `\naudio_preflight: unsupported\naudio_preflight_error: ${error.message}\nnew_message_sent: false`;
+    }
+  }
+  if (["image/png", "image/jpeg", "image/webp"].includes(file.mimetype) && file.bytes <= 8 * 1024 * 1024) {
+    content.push({ type: "image", mimeType: file.mimetype, data: (await fs.readFile(file.path)).toString("base64") });
+  }
+  return { content, isError: false };
+}
+
 server.tool(
   "whatsapp_send_message",
-  "Send a text message to a WhatsApp chat identified by id or name.",
+  "Send text or approved local media to a WhatsApp chat. Use media for image/video/audio/document/sticker and its reviewed file hash; text must be empty when media is provided.",
   {
     chatId: z.string().min(1).optional(),
     chatName: z.string().min(1).optional(),
-    text: z.string().min(1).max(4000)
+    text: z.string().max(4000).optional(),
+    media: z.object(mediaInput).optional()
   },
-  async ({ chatId, chatName, text }) => {
+  async ({ chatId, chatName, text, media }) => {
     try {
-      const chat = resolveChatOrError({ chatId, chatName });
+      const chat = resolveSendChatOrError({ chatId, chatName });
+      if (media) {
+        if (text?.trim()) throw new Error("Use media.caption instead of a separate text when sending media.");
+        return await submitMedia(chat, media);
+      }
+      if (typeof text !== "string" || !text.trim()) throw new Error("A nonempty text or a media attachment is required.");
       const bridgeState = await getBridgeState();
 
       if (bridgeState.ownsLiveSession) {
@@ -567,13 +671,73 @@ server.tool(
       }
 
       const socket = await runtime.ensureConnected();
-      await socket.sendMessage(chat.id, { text });
-      return textResult(`Sent message to ${chat.displayName} (${chat.id}).`);
+      const sent = await socket.sendMessage(chat.id, { text });
+      if (!sent?.key?.id) throw new Error("No message ID returned; outcome unknown. Do not automatically retry.");
+      runtime.store.ingestMessage(sent, { incrementUnread: false });
+      return textResult(`status: submitted\nchat: ${chat.displayName} (${chat.id})\nmessage_id: ${sent.key.id}\ndelivery: not_yet_verified`);
     } catch (error) {
       return textResult(error.message, { isError: true });
     }
   }
 );
 
+server.tool("whatsapp_prepare_media", "Validate a local image, video, audio, document or sticker and return its hash for review. Does not upload or send anything.", mediaInput, async input => {
+  try {
+    const { content, ...metadata } = await prepareMedia(input);
+    return textResult(JSON.stringify(metadata, null, 2));
+  } catch (error) { return textResult(error.message, { isError: true }); }
+});
+
+server.tool("whatsapp_send_media", "Send an approved local image, video, audio/voice note, document or WebP sticker. Use prepare_media for the exact file hash; submission is not delivery confirmation.", {
+  chatId: z.string().min(1).optional(), chatName: z.string().min(1).optional(), ...mediaInput
+}, async ({ chatId, chatName, ...input }) => {
+  try {
+    const chat = resolveSendChatOrError({ chatId, chatName });
+    return await submitMedia(chat, input);
+  } catch (error) { return textResult(error.message, { isError: true }); }
+});
+
+server.tool("whatsapp_download_media", "Download media from a cached message ID to a private local file. Returns an inline preview for small images. View-once media is excluded.", {
+  chatId: z.string().min(1).optional(), chatName: z.string().min(1).optional(), messageId: z.string().min(1)
+}, async ({ chatId, chatName, messageId }) => {
+  try {
+    const chat = resolveChatOrError({ chatId, chatName });
+    return await downloadCachedMedia(chat, messageId);
+  } catch (error) { return textResult(error.message, { isError: true }); }
+});
+
+server.tool("whatsapp_message_status", "Read the latest cached acknowledgement status for a specific message ID; does not mark messages read or send anything.", {
+  chatId: z.string().min(1).optional(), chatName: z.string().min(1).optional(), messageId: z.string().min(1)
+}, async ({ chatId, chatName, messageId }) => {
+  try {
+    if (runtime.state.status !== "connected") await runtime.store.load();
+    const chat = resolveChatOrError({ chatId, chatName });
+    const entry = (runtime.store.data.messages[chat.id] ?? []).find(message => message.id === messageId);
+    if (!entry) throw new Error("Message ID not found in this chat's cache.");
+    return textResult(`source: local_cache\nmessage_id: ${messageId}\nstatus: ${proto.WebMessageInfo.Status[entry.deliveryStatus] ?? "unknown"}`);
+  } catch (error) { return textResult(error.message, { isError: true }); }
+});
+
 const transport = new StdioServerTransport();
+let reloading = false;
+process.on("SIGHUP", async () => {
+  if (reloading) return;
+  if (typeof process.execve !== "function") {
+    console.error("In-place MCP reload requires a Node.js version with process.execve.");
+    return;
+  }
+  reloading = true;
+  try {
+    clearTimeout(runtime.store.pendingSave);
+    runtime.store.pendingSave = null;
+    await runtime.store.save();
+    await runtime.historyRequests.writes;
+    // Preserve the host's stdio transport while replacing only this MCP worker.
+    process.execve(process.execPath, [process.execPath, ...process.execArgv, ...process.argv.slice(1)], process.env);
+  } catch (error) {
+    reloading = false;
+    console.error("WhatsApp MCP reload failed", error.message);
+  }
+});
 await server.connect(transport);
+server.sendToolListChanged();

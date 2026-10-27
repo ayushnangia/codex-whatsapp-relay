@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Optional native-host final-send confirmation toggle for WhatsApp, with opt-in Slack/Gmail tool policies; draft/read preparation remains available without prompts and unrelated settings stay unchanged.
+- CI on Node.js 22 and 24 with reproducible dependency installation and checks for every JavaScript source file.
+
+### Fixed
+
+- Snapshot approved media bytes before connecting/uploading, so later source-file edits cannot change the outgoing attachment.
+- Ignore all runtime data, downloaded media, and pairing QR artifacts in Git.
+- Keep the documented `audio/ogg; codecs=opus` MIME for verified Opus input, reject conflicting codec declarations, and expose audio download preflight without another send.
+- Persist history request stanza IDs before dispatch, correlate exact sessions, retain timed-out requests for late-response checks, and prevent automatic retries at an unresolved anchor.
+- Resolve self-device receipts without recipient JIDs, retain per-recipient receipt timestamps across history merges, and expose real receipt counts without treating one group member as the whole group.
+- Support media through existing send/read MCP tools as well as dedicated media tools; add a tested in-place worker reload that preserves the host's stdio connection.
+- Preserve acknowledgement progress across duplicate pending snapshots and early receipts; record positive provider acknowledgements and keep history anchors separate from cache-boundary timestamps.
+- Serialize cache snapshots so a slow earlier write cannot replace a newer snapshot; clean up failed temporary writes without blocking subsequent saves.
+- Preserve and merge phone/LID identities, retain bounded raw media envelopes for downloads and retries, label cached-history completeness, avoid duplicate unread counts, and pass milliseconds to on-demand history requests.
+- Add local media preflight, image/video/audio/document/sticker submission, cached delivery-status inspection, and streaming media download with small-image previews. Actual send/download verification remains a separate live acceptance gate.
+- Backport Baileys companion registration refresh and pre-login notification acknowledgements for QR pairing on rc14; pin the dependency and reapply the reviewed fixes after installation.
+- Discard disconnected QR codes, reuse the live authentication socket, and ignore connection updates from replaced sockets.
+
 ## [0.4.3] - 2026-03-30
 
 ### Fixed

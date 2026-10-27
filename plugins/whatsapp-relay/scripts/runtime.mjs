@@ -9,12 +9,16 @@ import makeWASocket, {
   DisconnectReason,
   downloadMediaMessage,
   fetchLatestWaWebVersion,
+  generateMessageIDV2,
+  jidNormalizedUser,
+  proto,
   useMultiFileAuthState
 } from "@whiskeysockets/baileys";
 import pino from "pino";
 
-import { authDir, credsFile, ensureRuntimeDirs, runtimeFile, storeFile } from "./paths.mjs";
+import { authDir, credsFile, ensureRuntimeDirs, historyRequestsFile, runtimeFile, storeFile } from "./paths.mjs";
 import { WhatsAppStore } from "./store.mjs";
+import { HistoryRequests } from "./history-requests.mjs";
 
 const require = createRequire(import.meta.url);
 const QRCode = require("qrcode-terminal/vendor/QRCode");
@@ -128,22 +132,11 @@ function disconnectLabel(code) {
   }
 }
 
-function payloadHasChat(payload, chatId) {
-  if (!chatId) {
-    return false;
-  }
-
-  if ((payload.chats ?? []).some((chat) => chat?.id === chatId)) {
-    return true;
-  }
-
-  return (payload.messages ?? []).some((message) => message?.key?.remoteJid === chatId);
-}
-
 export class WhatsAppRuntime {
   constructor({ logLevel = "warn" } = {}) {
     this.logger = createLogger(logLevel);
     this.store = new WhatsAppStore(storeFile);
+    this.historyRequests = new HistoryRequests(historyRequestsFile);
     this.events = new EventEmitter();
     this.socket = null;
     this.startPromise = null;
@@ -156,6 +149,7 @@ export class WhatsAppRuntime {
       lastQrAt: null,
       currentQrText: null,
       lastDisconnect: null,
+      receivedPendingNotifications: false,
       authDir,
       runtimeFile
     };
@@ -164,6 +158,7 @@ export class WhatsAppRuntime {
   async initialize() {
     await ensureRuntimeDirs();
     await this.store.load();
+    await this.historyRequests.load();
   }
 
   hasSavedCreds() {
@@ -185,6 +180,11 @@ export class WhatsAppRuntime {
       return this.startPromise;
     }
 
+    if (!force && this.socket?.ws?.isOpen &&
+        ["connecting", "awaiting_qr_scan", "connected"].includes(this.state.status)) {
+      return this.socket;
+    }
+
     this.startPromise = this.#startInternal({ printQrToTerminal }).finally(() => {
       this.startPromise = null;
     });
@@ -195,9 +195,18 @@ export class WhatsAppRuntime {
   async #startInternal({ printQrToTerminal }) {
     await this.initialize();
     const { state, saveCreds } = await useMultiFileAuthState(authDir);
+    this.store.recordJidMapping({ pn: state.creds.me?.id, lid: state.creds.me?.lid });
+    // Recover cached mappings without network lookups or a second WhatsApp socket.
+    const phoneJids = Object.keys(this.store.data.chats).filter(id => id.endsWith("@s.whatsapp.net"));
+    const mappings = await state.keys.get("lid-mapping", phoneJids.map(id => id.split("@")[0]));
+    for (const pn of phoneJids) {
+      const lidUser = mappings[pn.split("@")[0]];
+      if (typeof lidUser === "string") this.store.recordJidMapping({ pn, lid: `${lidUser}@lid` });
+    }
     const { version } = await fetchLatestWaWebVersion();
 
     this.state.status = "connecting";
+    this.state.currentQrText = null;
     this.state.hasCreds = this.hasSavedCreds();
 
     const socket = makeWASocket({
@@ -207,6 +216,7 @@ export class WhatsAppRuntime {
       printQRInTerminal: false,
       syncFullHistory: false,
       markOnlineOnConnect: false,
+      getMessage: async key => this.store.getRawMessage(key.remoteJid, key.id)?.message,
       logger: this.logger
     });
 
@@ -220,11 +230,15 @@ export class WhatsAppRuntime {
     });
 
     socket.ev.on("messaging-history.set", (payload) => {
+      if (socket !== this.socket) return;
       this.store.ingestHistory(payload);
+      this.historyRequests.recordResponse(payload, value => this.store.canonicalJid(value))
+        .catch(error => this.logger.error({ err: error }, "Failed to persist history response metadata"));
       this.events.emit("messaging-history.set", payload);
     });
 
     socket.ev.on("contacts.upsert", (contacts) => {
+      if (socket !== this.socket) return;
       for (const contact of contacts) {
         this.store.upsertContact(contact);
       }
@@ -232,6 +246,7 @@ export class WhatsAppRuntime {
     });
 
     socket.ev.on("contacts.update", (contacts) => {
+      if (socket !== this.socket) return;
       for (const contact of contacts) {
         this.store.upsertContact(contact);
       }
@@ -239,6 +254,7 @@ export class WhatsAppRuntime {
     });
 
     socket.ev.on("chats.upsert", (chats) => {
+      if (socket !== this.socket) return;
       for (const chat of chats) {
         this.store.upsertChat(chat);
       }
@@ -246,19 +262,46 @@ export class WhatsAppRuntime {
     });
 
     socket.ev.on("chats.update", (chats) => {
+      if (socket !== this.socket) return;
       for (const chat of chats) {
         this.store.upsertChat(chat);
       }
       this.events.emit("chats.update", chats);
     });
 
-    socket.ev.on("messages.upsert", ({ messages }) => {
+    socket.ev.on("lid-mapping.update", mapping => {
+      if (socket === this.socket) this.store.recordJidMapping(mapping);
+    });
+
+    socket.ev.on("messages.upsert", ({ messages, type }) => {
+      if (socket !== this.socket) return;
+      this.store.updateMeta({ lastMessageEventAt: new Date().toISOString() });
       for (const message of messages ?? []) {
-        this.store.ingestMessage(message);
+        this.store.ingestMessage(message, { incrementUnread: type === "notify" });
       }
     });
 
+    socket.ev.on("messages.update", updates => {
+      if (socket !== this.socket) return;
+      for (const { key, update } of updates) this.store.updateMessage(key, update);
+    });
+
+    socket.ev.on("message-receipt.update", updates => {
+      if (socket !== this.socket) return;
+      for (const { key, receipt } of updates) this.store.updateReceipt(key, receipt);
+    });
+
+    socket.ws.on("CB:ack,class:message", ({ attrs = {} }) => {
+      if (socket !== this.socket || !attrs.id) return;
+      this.historyRequests.recordAck(attrs.id, attrs.error)
+        .catch(error => this.logger.error({ err: error }, "Failed to persist history ACK metadata"));
+      if (attrs.error) return;
+      this.store.updateMessage({ remoteJid: attrs.from, id: attrs.id, fromMe: true }, { status: proto.WebMessageInfo.Status.SERVER_ACK });
+    });
+
     socket.ev.on("connection.update", (update) => {
+      if (socket !== this.socket) return;
+      if (typeof update.receivedPendingNotifications === "boolean") this.state.receivedPendingNotifications = update.receivedPendingNotifications;
       if (update.qr) {
         this.state.lastQrAt = new Date().toISOString();
         this.state.status = "awaiting_qr_scan";
@@ -289,6 +332,8 @@ export class WhatsAppRuntime {
       }
 
       if (update.connection === "close") {
+        this.state.receivedPendingNotifications = false;
+        this.state.currentQrText = null;
         const code = disconnectCode(update.lastDisconnect?.error);
         const label = disconnectLabel(code);
         this.state.status =
@@ -385,7 +430,8 @@ export class WhatsAppRuntime {
       };
     }
 
-    if (this.state.currentQrText) {
+    if (this.state.status === "awaiting_qr_scan" && this.socket?.ws?.isOpen &&
+        this.state.currentQrText) {
       return {
         status: "awaiting_qr_scan",
         user: null,
@@ -421,180 +467,112 @@ export class WhatsAppRuntime {
     );
   }
 
-  async syncChatHistory({ chatId, count = 50, timeoutMs = 20_000 }) {
+  async syncChatHistory({ chatId, count = 50, timeoutMs = 20_000, beforeMessageId }) {
+    await this.historyRequests.load();
+    chatId = this.store.canonicalJid?.(chatId) ?? chatId;
+    const cacheOldestBefore = this.store.getOldestMessage(chatId);
+    const anchor = beforeMessageId
+      ? this.store.getMessages(chatId, this.store.getMessageLimit(chatId)).find(message => message.id === beforeMessageId)
+      : cacheOldestBefore;
+    if (beforeMessageId && !anchor) throw new Error("History anchor message ID was not found in this chat's cache.");
+    if (!anchor?.timestamp) throw new Error("History sync requires a cached anchor message with a timestamp.");
+
+    const unresolved = this.historyRequests.findUnresolved(chatId, anchor.id);
+    if (unresolved) return { ...unresolved, reused: true, sessionId: unresolved.sessionId, timedOut: true };
+
     const socket = await this.ensureConnected();
-    const oldestMessage = this.store.getOldestMessage(chatId);
-
-    if (!oldestMessage) {
-      throw new Error(
-        `No cached messages found for ${chatId}. Read or sync the chat once before requesting older history.`
-      );
-    }
-
-    if (!oldestMessage.timestamp) {
-      throw new Error(
-        `The oldest cached message for ${chatId} has no timestamp, so older history cannot be requested.`
-      );
-    }
-
+    // Another concurrent caller may have prepared the same anchor while this
+    // call was waiting for the connection.
+    const pending = this.historyRequests.findUnresolved(chatId, anchor.id);
+    if (pending) return { ...pending, reused: true, sessionId: pending.sessionId, timedOut: true };
     const beforeCount = this.store.getMessageCount(chatId);
     this.store.ensureMessageCapacity(chatId, beforeCount + count + 25);
-
-    const requestSession = {
-      current: null
+    const sessionId = generateMessageIDV2(socket.user?.id);
+    const record = {
+      sessionId, chatId, count, state: "prepared", createdAt: new Date().toISOString(),
+      anchorMessageId: anchor.id, anchorTimestamp: anchor.timestamp,
+      beforeCount, oldestTimestampBefore: cacheOldestBefore?.timestamp ?? null,
+      events: 0, receivedMessageIds: [], sessionMatched: false
     };
-    const syncResultPromise = this.#waitForHistorySync({
-      chatId,
-      getSessionId: () => requestSession.current,
-      timeoutMs
-    });
-
-    requestSession.current = await socket.fetchMessageHistory(
-      count,
-      {
-        remoteJid: oldestMessage.chatId,
-        id: oldestMessage.id,
-        fromMe: oldestMessage.fromMe,
-        participant: oldestMessage.participant ?? undefined
-      },
-      oldestMessage.timestamp
-    );
-
-    const syncResult = await syncResultPromise;
-    const oldestAfter = this.store.getOldestMessage(chatId);
-
-    return {
-      ...syncResult,
-      sessionId: requestSession.current,
-      beforeCount,
+    // Persist the exact stanza ID before dispatch. The SDK's convenience method
+    // generates its ID internally, which loses it if dispatch or the wait fails.
+    await this.historyRequests.update(sessionId, record);
+    const abort = new AbortController();
+    const waiting = this.#waitForHistorySync({ chatId, sessionId, timeoutMs, signal: abort.signal });
+    try {
+      await socket.relayMessage(jidNormalizedUser(socket.user.id), {
+        protocolMessage: {
+          type: proto.Message.ProtocolMessage.Type.PEER_DATA_OPERATION_REQUEST_MESSAGE,
+          peerDataOperationRequestMessage: {
+            peerDataOperationRequestType: proto.Message.PeerDataOperationRequestType.HISTORY_SYNC_ON_DEMAND,
+            historySyncOnDemandRequest: {
+              chatJid: anchor.chatId, oldestMsgFromMe: anchor.fromMe, oldestMsgId: anchor.id,
+              oldestMsgTimestampMs: anchor.timestamp * 1000, onDemandMsgCount: count
+            }
+          }
+        }
+      }, {
+        messageId: sessionId,
+        additionalAttributes: { category: "peer", push_priority: "high_force" },
+        additionalNodes: [{ tag: "meta", attrs: { appdata: "default" } }]
+      });
+    } catch (error) {
+      abort.abort();
+      await waiting;
+      const failed = await this.historyRequests.update(sessionId, previous => ({
+        state: previous.state === "response_received" ? previous.state : "dispatch_unknown",
+        error: error.message
+      }));
+      return { ...failed, sessionId, timedOut: true };
+    }
+    const result = await waiting;
+    const completed = await this.historyRequests.update(sessionId, previous => ({
+      ...result,
+      state: previous.state === "provider_rejected" ? previous.state
+        : previous.state === "response_received" || result.sessionMatched ? "response_received" : "timed_out_waiting_response",
       afterCount: this.store.getMessageCount(chatId),
-      oldestTimestampBefore: oldestMessage.timestamp,
-      oldestTimestampAfter: oldestAfter?.timestamp ?? oldestMessage.timestamp,
+      oldestTimestampAfter: this.store.getOldestMessage(chatId)?.timestamp ?? anchor.timestamp,
       retentionLimit: this.store.getMessageLimit(chatId)
-    };
+    }));
+    return { ...completed, sessionId };
   }
 
-  #waitForHistorySync({ chatId, getSessionId, timeoutMs = 20_000 }) {
-    return new Promise((resolve, reject) => {
-      const bufferedPayloads = [];
+  #waitForHistorySync({ chatId, sessionId, timeoutMs, signal }) {
+    return new Promise(resolve => {
       let done = false;
-      let receivedAny = false;
-      let idleTimer = null;
-      let bufferDrainTimer = null;
-
-      const summary = {
-        events: 0,
-        chats: 0,
-        contacts: 0,
-        messages: 0,
-        lastProgress: null,
-        isLatest: false,
-        timedOut: false
-      };
-
-      const cleanup = () => {
-        if (idleTimer) {
-          clearTimeout(idleTimer);
-          idleTimer = null;
-        }
-
-        if (bufferDrainTimer) {
-          clearInterval(bufferDrainTimer);
-          bufferDrainTimer = null;
-        }
-
+      let idleTimer;
+      const summary = { events: 0, chats: 0, contacts: 0, messages: 0,
+        lastProgress: null, isLatest: false, timedOut: false, sessionMatched: false, receivedMessageIds: [] };
+      const finish = extra => {
+        if (done) return;
+        done = true;
+        clearTimeout(idleTimer);
         clearTimeout(timeoutTimer);
         this.events.off("messaging-history.set", onHistory);
+        signal.removeEventListener("abort", onAbort);
+        resolve({ ...summary, ...extra });
       };
-
-      const finish = (result) => {
-        if (done) {
-          return;
-        }
-
-        done = true;
-        cleanup();
-        resolve(result);
-      };
-
-      const fail = (error) => {
-        if (done) {
-          return;
-        }
-
-        done = true;
-        cleanup();
-        reject(error);
-      };
-
-      const scheduleIdleFinish = () => {
-        if (idleTimer) {
-          clearTimeout(idleTimer);
-        }
-
-        idleTimer = setTimeout(() => {
-          finish(summary);
-        }, 750);
-      };
-
-      const maybeHandlePayload = (payload) => {
-        const expectedSessionId = getSessionId();
-        if (!expectedSessionId) {
-          bufferedPayloads.push(payload);
-          return;
-        }
-
-        const sessionMatches = payload.peerDataRequestSessionId === expectedSessionId;
-        const chatMatches = payloadHasChat(payload, chatId);
-
-        if (!sessionMatches && !(payload.peerDataRequestSessionId == null && chatMatches)) {
-          return;
-        }
-
-        receivedAny = true;
-        summary.events += 1;
-        summary.chats += (payload.chats ?? []).filter((chat) => chat?.id === chatId).length;
+      const onAbort = () => finish({ aborted: true });
+      const onHistory = payload => {
+        // A chat-only event may belong to initial sync or a different request.
+        if (payload.peerDataRequestSessionId !== sessionId) return;
+        const canonical = value => this.store.canonicalJid?.(value) ?? value;
+        const matching = (payload.messages ?? []).filter(message => canonical(message.key?.remoteJid) === canonical(chatId));
+        summary.sessionMatched = true;
+        summary.events++;
+        summary.chats += (payload.chats ?? []).filter(chat => canonical(chat.id) === canonical(chatId)).length;
         summary.contacts += (payload.contacts ?? []).length;
-        summary.messages += (payload.messages ?? []).filter(
-          (message) => message?.key?.remoteJid === chatId
-        ).length;
+        summary.messages += matching.length;
+        summary.receivedMessageIds = [...new Set([...summary.receivedMessageIds, ...matching.map(message => message.key.id).filter(Boolean)])].slice(0, 100);
         summary.lastProgress = payload.progress ?? summary.lastProgress;
-        summary.isLatest = payload.isLatest ?? summary.isLatest;
-
-        if (payload.isLatest === true) {
-          finish(summary);
-          return;
-        }
-
-        scheduleIdleFinish();
+        summary.isLatest ||= payload.isLatest === true;
+        if (summary.isLatest) return finish();
+        clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => finish(), 750);
       };
-
-      const onHistory = (payload) => {
-        maybeHandlePayload(payload);
-      };
-
-      const timeoutTimer = setTimeout(() => {
-        if (receivedAny) {
-          finish({
-            ...summary,
-            timedOut: true
-          });
-          return;
-        }
-
-        fail(new Error(`Timed out waiting for older history for ${chatId}.`));
-      }, timeoutMs);
-
+      const timeoutTimer = setTimeout(() => finish({ timedOut: true }), timeoutMs);
+      signal.addEventListener("abort", onAbort, { once: true });
       this.events.on("messaging-history.set", onHistory);
-      bufferDrainTimer = setInterval(() => {
-        if (!getSessionId() || !bufferedPayloads.length) {
-          return;
-        }
-
-        for (const payload of bufferedPayloads.splice(0)) {
-          maybeHandlePayload(payload);
-        }
-      }, 100);
     });
   }
 
