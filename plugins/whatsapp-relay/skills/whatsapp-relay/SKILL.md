@@ -58,6 +58,22 @@ Use this skill when the user wants to connect WhatsApp, inspect recent chats, re
 
 ## Rules
 
+- Saved credentials do not imply a live connection. Check auth and controller
+  status when lookup is empty or stale. An idle MCP reads an old cache until the
+  saved session is reconnected; use `whatsapp_start_auth` once only after checking
+  that no bridge or other MCP worker already owns the live session. Do not relink
+  or open another socket to work around an existing owner.
+- A queried result marked `contact_only` identifies a cached direct contact, not
+  a synchronized conversation. Missing history does not prove that the contact
+  or messages are absent on the phone. Keep duplicate names ambiguous and use a
+  verified recipient ID when available; never guess from a group-name match.
+- Native UI labels and received contact labels can differ. Search distinctive
+  name components and review all candidates before selecting a direct recipient.
+  Explain a concrete connector blocker before considering a UI fallback.
+- A connected socket and a recent cache write do not prove newest-phone history
+  completeness. On-demand history sync fetches messages older than its anchor.
+  Reconcile existing message IDs and delivery evidence; never resend a message
+  merely because the cache or its receipts are incomplete.
 - Do not guess a chat if multiple names match. List candidates first.
 - If the user asks for older messages that are not in the local cache yet, use `whatsapp_sync_history` before concluding the history is unavailable.
 - Keep outbound messages short and explicit when the user asks you to send one.

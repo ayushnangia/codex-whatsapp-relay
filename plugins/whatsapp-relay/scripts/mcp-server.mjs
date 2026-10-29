@@ -5,6 +5,7 @@ import fs from "node:fs/promises";
 import { proto } from "@whiskeysockets/baileys";
 import { prepareMedia, freezePreparedMedia, downloadMessageMedia } from "./media.mjs";
 import { unwrapMessage } from "./store.mjs";
+import { cacheStatusLines, missingHistoryHint } from "./cache-status.mjs";
 
 import { ControllerConfigStore } from "./controller-config.mjs";
 import {
@@ -32,6 +33,8 @@ function chatSummary(chat) {
   const stamp = chat.lastMessageTimestamp ?? chat.timestamp;
   return [
     `- ${chat.displayName} (${chat.id})`,
+    `kind=${chat.cacheEntryKind ?? "cached_chat"}`,
+    `cached_messages=${chat.cachedMessageCount ?? "unknown"}`,
     `  unread=${chat.unreadCount ?? 0}`,
     stamp ? `last=${new Date(stamp * 1000).toISOString()}` : null,
     chat.lastMessageText ? `text=${chat.lastMessageText}` : null
@@ -81,6 +84,14 @@ async function getBridgeState() {
     processStatus,
     ownsLiveSession: config.enabled && processStatus.running
   };
+}
+
+async function currentCacheStatusLines() {
+  const summary = runtime.summary();
+  const bridge = await getBridgeState();
+  return cacheStatusLines(bridge.ownsLiveSession
+    ? { ...summary, status: bridge.processStatus.process.whatsappStatus ?? "bridge_state_unknown", sessionOwner: "controller_bridge" }
+    : summary, runtime.store.data.meta);
 }
 
 async function ensureDirectRuntimeAvailable(action) {
@@ -167,7 +178,7 @@ function controllerSummaryLines(config, processStatus) {
   return lines;
 }
 
-function resolveChatOrError({ chatId, chatName }) {
+function resolveChatOrError({ chatId, chatName }, freshness = cacheStatusLines(runtime.summary(), runtime.store.data.meta)) {
   const resolved = runtime.store.resolveChat({ chatId, chatName });
   if (resolved.match) {
     return resolved.match;
@@ -183,9 +194,10 @@ function resolveChatOrError({ chatId, chatName }) {
   }
 
   throw new Error(
-    chatId
+    (chatId
       ? `Chat "${chatId}" was not found in the local WhatsApp cache.`
-      : `Chat "${chatName}" was not found in the local WhatsApp cache.`
+      : `Chat "${chatName}" was not found in the local WhatsApp cache.`) +
+      "\n" + freshness.join("\n") + "\n" + missingHistoryHint
   );
 }
 
@@ -210,6 +222,10 @@ server.tool(
   {},
   async () => {
     try {
+      const bridge = await getBridgeState();
+      if (bridge.ownsLiveSession) {
+        throw new Error("The controller bridge owns the live WhatsApp session. Reuse that owner; a second direct authentication socket is blocked.");
+      }
       const result = await runtime.startAuthFlow();
       if (result.status === "connected") {
         return textResult(
@@ -258,6 +274,8 @@ server.tool(
     lines.push("history_completeness: not_verified");
     lines.push(`pending_notifications_received: ${summary.receivedPendingNotifications ? "yes" : "no"}`);
     lines.push("features: send_message_media_v1, read_message_media_v1, in_place_reload_v1, history_request_journal_v1, receipt_evidence_v1");
+    lines.push(...cacheStatusLines({ ...summary, status, sessionOwner: bridgeState.ownsLiveSession ? "controller_bridge" : undefined }, runtime.store.data.meta).filter(line =>
+      /^(runtime_pid:|sync_state:|next_step:)/.test(line)));
 
     if (summary.user?.id) {
       lines.push(`user: ${summary.user.id}`);
@@ -488,11 +506,12 @@ server.tool(
     try {
       if (runtime.state.status !== "connected") await runtime.store.load();
       const chats = runtime.store.listChats({ limit, query, unreadOnly });
+      const state = await currentCacheStatusLines();
       if (!chats.length) {
-        return textResult("No chats matched the requested filter.");
+        return textResult([...state, "lookup_result: no_cached_match", "No cached chats or direct contacts matched the requested filter.", missingHistoryHint].join("\n"));
       }
 
-      return textResult(["source: local_cache", "history_completeness: not_verified", ...chats.map(chatSummary)].join("\n"));
+      return textResult([...state, ...chats.map(chatSummary)].join("\n"));
     } catch (error) {
       return textResult(error.message, { isError: true });
     }
@@ -512,7 +531,8 @@ server.tool(
   async ({ chatId, chatName, limit = 20, messageId, downloadMedia = false }) => {
     try {
       if (runtime.state.status !== "connected") await runtime.store.load();
-      const chat = resolveChatOrError({ chatId, chatName });
+      const freshness = await currentCacheStatusLines();
+      const chat = resolveChatOrError({ chatId, chatName }, freshness);
       if (downloadMedia) {
         if (!messageId) throw new Error("Downloading media requires an exact messageId.");
         return await downloadCachedMedia(chat, messageId);
@@ -522,13 +542,14 @@ server.tool(
         : runtime.store.getMessages(chat.id, limit);
 
       if (!messages.length) {
-        return textResult(`No cached messages found for ${chat.displayName}.`);
+        return textResult([`chat: ${chat.displayName} (${chat.id})`,
+          `kind: ${chat.cacheEntryKind ?? "cached_chat"}`,
+          ...freshness,
+          `No cached messages found for ${chat.displayName}.`, missingHistoryHint].join("\n"));
       }
 
       return textResult(
-        [`chat: ${chat.displayName} (${chat.id})`, "source: local_cache", "history_completeness: not_verified",
-          `connection: ${runtime.state.status}`, `last_history_sync_at: ${runtime.store.data.meta.lastHistorySyncAt ?? "unknown"}`,
-          `last_message_event_at: ${runtime.store.data.meta.lastMessageEventAt ?? "unknown"}`,
+        [`chat: ${chat.displayName} (${chat.id})`, ...freshness,
           ...messages.map(messageSummary)].join("\n")
       );
     } catch (error) {

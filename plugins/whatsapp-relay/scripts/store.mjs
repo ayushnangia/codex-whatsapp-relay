@@ -170,7 +170,17 @@ export function extractAudioMessage(message) {
   return payload.audioMessage;
 }
 
+function normalizedName(value) {
+  return String(value ?? "").normalize("NFKC").replace(/\p{Cf}/gu, "").replace(/\s+/gu, " ").trim().toLowerCase();
+}
+
 function preferredChatName(chat, contact) {
+  if (!chat.isGroup && !chat.id.endsWith("@g.us")) {
+    const names = [contact?.name, chat.name, contact?.notify, contact?.verifiedName, chat.pushName];
+    const named = names.find(value => value && value !== chat.id &&
+      !/^[+\d\s().:·∙•*‐‑–-]+$/u.test(value));
+    if (named) return named;
+  }
   return (
     chat.name ||
     chat.subject ||
@@ -487,9 +497,9 @@ export class WhatsAppStore {
       displayName: preferredChatName(currentChat, contact),
       name:
         currentChat.name ??
-        message.pushName ??
         contact?.name ??
         contact?.notify ??
+        (!messageEntry.fromMe && !currentChat.isGroup ? message.pushName : null) ??
         null,
       ...(shouldUpdateLastMessage
         ? {
@@ -509,9 +519,26 @@ export class WhatsAppStore {
     this.scheduleSave();
   }
 
+  contactCandidate(id) {
+    id = this.canonicalJid(id);
+    const contact = this.data.contacts[id];
+    if (!contact || !/@(?:s\.whatsapp\.net|lid)$/.test(id)) return null;
+    const candidate = { id, isGroup: false, cacheEntryKind: "contact_only", cachedMessageCount: 0 };
+    return { ...candidate, displayName: preferredChatName(candidate, contact) };
+  }
+
   listChats({ limit = 20, query, unreadOnly = false } = {}) {
-    const normalizedQuery = query?.trim().toLowerCase();
-    const chats = Object.values(this.data.chats)
+    const normalizedQuery = normalizedName(query);
+    const entries = new Map(Object.values(this.data.chats).map(chat => [chat.id, {
+      ...chat, cacheEntryKind: "cached_chat", cachedMessageCount: this.getMessageCount(chat.id)
+    }]));
+    // A saved contact can be searchable before conversation history arrives.
+    // Do not fabricate a cached chat or persist an empty message history.
+    if (normalizedQuery) for (const id of Object.keys(this.data.contacts)) {
+      const candidate = this.contactCandidate(id);
+      if (candidate && !entries.has(candidate.id)) entries.set(candidate.id, candidate);
+    }
+    const chats = [...entries.values()]
       .map((chat) => ({
         ...chat,
         displayName: preferredChatName(chat, this.data.contacts[chat.id])
@@ -529,12 +556,15 @@ export class WhatsAppStore {
           chat.id,
           chat.displayName,
           chat.name,
+          chat.subject,
+          chat.pushName,
           this.data.contacts[chat.id]?.name,
-          this.data.contacts[chat.id]?.notify
+          this.data.contacts[chat.id]?.notify,
+          this.data.contacts[chat.id]?.verifiedName
         ]
           .filter(Boolean)
-          .join(" ")
-          .toLowerCase();
+          .map(normalizedName)
+          .join(" ");
 
         return haystack.includes(normalizedQuery);
       })
@@ -635,7 +665,11 @@ export class WhatsAppStore {
   resolveChat({ chatId, chatName }) {
     if (chatId) {
       chatId = this.canonicalJid(chatId);
-      const exact = this.data.chats[chatId];
+      const cached = this.data.chats[chatId];
+      const exact = cached ? { ...cached,
+        displayName: preferredChatName(cached, this.data.contacts[chatId]),
+        cacheEntryKind: "cached_chat", cachedMessageCount: this.getMessageCount(chatId)
+      } : this.contactCandidate(chatId);
       if (exact) {
         return {
           match: exact,
@@ -649,7 +683,7 @@ export class WhatsAppStore {
       };
     }
 
-    const query = chatName?.trim().toLowerCase();
+    const query = normalizedName(chatName);
     if (!query) {
       return {
         match: null,
@@ -663,11 +697,14 @@ export class WhatsAppStore {
         chat.id,
         chat.displayName,
         chat.name,
+        chat.subject,
+        chat.pushName,
         this.data.contacts[chat.id]?.name,
-        this.data.contacts[chat.id]?.notify
+        this.data.contacts[chat.id]?.notify,
+        this.data.contacts[chat.id]?.verifiedName
       ]
         .filter(Boolean)
-        .map((value) => value.toLowerCase());
+        .map(normalizedName);
 
       return names.includes(query);
     });

@@ -14,6 +14,54 @@ async function fixture(t) {
 const pn = "10000000000@s.whatsapp.net", lid = "20000000000@lid";
 const message = (id, remoteJid, time, text, extra = {}) => ({ key: { id, remoteJid, fromMe: false }, messageTimestamp: time, message: { conversation: text }, ...extra });
 
+test("queried direct contacts resolve without fabricating a conversation or history", async t => {
+  const store = await fixture(t);
+  store.upsertContact({ id: pn, name: "Synthetic\u00a0 Researcher", verifiedName: "Synthetic Lab" });
+  assert.equal(store.listChats().length, 0);
+  const match = store.resolveChat({ chatName: "synthetic researcher" }).match;
+  assert.equal(match.id, pn);
+  assert.equal(match.cacheEntryKind, "contact_only");
+  assert.equal(store.getMessageCount(match.id), 0);
+  assert.equal(store.resolveChat({ chatId: pn }).match.id, pn);
+  assert.equal(store.listChats({ query: "Synthetic Lab" }).length, 1);
+  assert.equal(store.listChats({ query: "Synthetic", unreadOnly: true }).length, 0);
+  assert.equal(Object.keys(store.data.chats).length, 0);
+  assert.equal(Object.keys(store.data.messages).length, 0);
+});
+
+test("same names in cached chats and contact-only records remain ambiguous", async t => {
+  const store = await fixture(t);
+  store.upsertChat({ id: pn, name: "Synthetic duplicate" });
+  store.upsertContact({ id: "10000000001@s.whatsapp.net", name: "Synthetic duplicate" });
+  const result = store.resolveChat({ chatName: "Synthetic duplicate" });
+  assert.equal(result.match, null);
+  assert.equal(result.candidates.length, 2);
+  store.upsertContact({ id: lid, phoneNumber: pn, name: "Synthetic duplicate" });
+  assert.equal(store.listChats({ query: "Synthetic duplicate" }).length, 2);
+});
+
+test("human contact labels replace masked phone names without renaming groups", async t => {
+  const store = await fixture(t);
+  store.upsertChat({ id: pn, name: "+1\u2219\u2219\u221900" });
+  store.upsertContact({ id: pn, name: "+1\u2219\u2219\u221900", notify: "Synthetic recipient" });
+  assert.equal(store.listChats({ query: "Synthetic recipient" })[0].displayName, "Synthetic recipient");
+  store.upsertContact({ id: pn, name: "Saved researcher" });
+  assert.equal(store.listChats()[0].displayName, "Saved researcher");
+  store.upsertChat({ id: "10000000000@g.us", name: "Synthetic group" });
+  store.upsertContact({ id: "10000000000@g.us", notify: "Participant" });
+  assert.equal(store.listChats({ query: "Synthetic group" })[0].displayName, "Synthetic group");
+});
+
+test("outgoing sender labels never become the recipient name", async t => {
+  const store = await fixture(t);
+  const outgoing = message("outgoing", pn, 1, "synthetic", { pushName: "Own sender label" });
+  outgoing.key.fromMe = true;
+  store.ingestMessage(outgoing);
+  assert.equal(store.listChats({ query: "Own sender label" }).length, 0);
+  store.ingestMessage(message("incoming", pn, 2, "synthetic", { pushName: "Peer label" }));
+  assert.equal(store.listChats({ query: "Peer label" }).length, 1);
+});
+
 test("phone and LID histories merge without losing recent messages or the saved name", async t => {
   const store = await fixture(t);
   store.upsertContact({ id: pn, name: "Synthetic parent" });

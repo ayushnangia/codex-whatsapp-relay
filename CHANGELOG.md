@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Search direct contacts before their conversation history arrives, preserve duplicate-name ambiguity, prefer human contact labels over masked phone placeholders, and expose disconnected-cache recovery steps without treating missing cache entries as absent phone conversations.
+
 - Apply the optional final-send confirmation toggle to separately named official Slack MCP connections, without changing their authentication or enabled state.
 
 ### Added
