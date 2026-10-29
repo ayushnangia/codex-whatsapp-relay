@@ -25,7 +25,9 @@ test("MCP separates recipient contacts from history and exposes idle-cache failu
   try {
     await client.connect(transport);
     const status = await call("whatsapp_auth_status", {});
-    assert.match(status.content[0].text, new RegExp(`runtime_pid: ${transport.pid}\\b`));
+    // Workers proxy to one shared runtime daemon, so the pid is the daemon's, not the worker's.
+    assert.match(status.content[0].text, /runtime_mode: daemon/);
+    assert.doesNotMatch(status.content[0].text, new RegExp(`runtime_pid: ${transport.pid}\\b`));
     const found = await call("whatsapp_list_chats", { query: "Synthetic Researcher" });
     assert.match(found.content[0].text, /kind=contact_only cached_messages=0/);
     assert.match(found.content[0].text, /sync_state: cache_only_disconnected/);
@@ -46,6 +48,8 @@ test("MCP separates recipient contacts from history and exposes idle-cache failu
     assert.equal(Object.keys(persisted.messages).length, 0);
   } finally {
     await client.close();
+    const lock = await fs.readFile(path.join(directory, "runtime-daemon.json"), "utf8").then(JSON.parse).catch(() => null);
+    if (lock?.pid) { try { process.kill(lock.pid, "SIGTERM"); } catch {} }
     await fs.rm(directory, { recursive: true, force: true });
   }
 });

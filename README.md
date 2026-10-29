@@ -409,6 +409,33 @@ it does not establish delivery to the recipient's phone or audio playback.
 backports to the pinned Baileys rc14 dependency. Review `scripts/patch-baileys.mjs`
 before changing the Baileys version. These fixes are reapplied on every install of the pinned dependency.
 
+## Headless tools and the runtime daemon
+
+Codex starts one MCP worker per thread. WhatsApp allows one live socket per
+linked device, so the workers no longer connect themselves: the first tool call
+starts `runtime-daemon.mjs`, a single background process per data directory that
+owns the socket, and every worker proxies to it over a private Unix socket
+(`runtime.sock`, mode 0600). The daemon reconnects on its own after network
+drops, hands the session to the controller bridge or the terminal QR flow while
+they run, restarts itself after the relay scripts are updated, and exits after
+ten idle minutes when no credentials exist. If it cannot be reached, workers
+answer read-only tools from the cache (`runtime_mode: cache_only`) and refuse to
+send. Set `WHATSAPP_DAEMON=off` to keep the previous in-process behaviour.
+
+Beyond chat listing, reading and sending, the MCP covers what an agent would
+otherwise need the WhatsApp UI for:
+
+- `whatsapp_search_messages` — full-text search across cached chats.
+- `whatsapp_wait_for_messages` — long-poll for new messages from a cursor.
+- `phoneNumber` recipients (verified with WhatsApp first) and `replyToMessageId` quoting.
+- `whatsapp_react`, `whatsapp_edit_message`, `whatsapp_delete_message`, `whatsapp_forward_message`, `whatsapp_mark_read`.
+- `whatsapp_send_poll`, `whatsapp_send_location`.
+- `whatsapp_check_number`, `whatsapp_contact_info`, `whatsapp_group_info`.
+- `whatsapp_reconnect` — reopen the saved session after it was replaced or dropped.
+
+If a sending call loses its connection to the daemon after it was submitted,
+the result says `outcome: unknown`; read the chat before trying again.
+
 ## CLI Fallback
 
 If you need to test outside Codex:

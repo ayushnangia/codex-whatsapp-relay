@@ -259,3 +259,92 @@ test("real receipt timestamps survive history merges without promoting zero time
   store.ingestMessage({ ...raw, key: { ...raw.key, id: "zero" }, userReceipt: [{ userJid: pn, receiptTimestamp: 0 }] });
   assert.equal(store.getMessages(pn).find(item => item.id === "zero").deliveryStatus, 1);
 });
+
+test("phone numbers resolve in any common format, with or without country code", async t => {
+  const store = await fixture(t);
+  store.upsertContact({ id: "919876543210@s.whatsapp.net", name: "Synthetic phone contact" });
+  store.upsertChat({ id: "15550001111@s.whatsapp.net", name: "Synthetic US chat" });
+  for (const query of ["+91 98765 43210", "919876543210", "098765-43210", "(987) 654-3210"]) {
+    assert.equal(store.resolveChat({ chatName: query }).match?.id, "919876543210@s.whatsapp.net", query);
+  }
+  assert.equal(store.listChats({ query: "+1 555 000 1111" })[0].id, "15550001111@s.whatsapp.net");
+  assert.equal(store.listChats({ query: "12345" }).length, 0, "short digit runs are not phone lookups");
+});
+
+test("name search folds accents and matches words in any order", async t => {
+  const store = await fixture(t);
+  store.upsertContact({ id: pn, name: "José Álvarez Núñez" });
+  assert.equal(store.resolveChat({ chatName: "jose alvarez" }).match?.id, pn);
+  assert.equal(store.resolveChat({ chatName: "nunez jose" }).match?.id, pn);
+  assert.equal(store.listChats({ query: "JOSÉ" }).length, 1);
+});
+
+test("message search finds cached text across chats, newest first, with chat names", async t => {
+  const store = await fixture(t);
+  store.upsertChat({ id: pn, name: "Synthetic alpha" });
+  store.upsertChat({ id: "10000000001@s.whatsapp.net", name: "Synthetic beta" });
+  store.ingestMessage(message("a1", pn, 10, "Invoice number 42 is ready"));
+  store.ingestMessage(message("a2", pn, 20, "unrelated"));
+  store.ingestMessage(message("b1", "10000000001@s.whatsapp.net", 30, "Second invoice for café"));
+  const hits = store.searchMessages({ query: "invoice" });
+  assert.deepEqual(hits.map(hit => hit.id), ["b1", "a1"]);
+  assert.equal(hits[0].chatName, "Synthetic beta");
+  assert.deepEqual(store.searchMessages({ query: "cafe invoice" }).map(hit => hit.id), ["b1"]);
+  assert.deepEqual(store.searchMessages({ query: "invoice", chatId: pn }).map(hit => hit.id), ["a1"]);
+  assert.deepEqual(store.searchMessages({ query: "invoice", limit: 1 }).map(hit => hit.id), ["b1"]);
+});
+
+test("messages since a cursor are listed oldest first and exclude own messages by default", async t => {
+  const store = await fixture(t);
+  store.ingestMessage(message("old", pn, 10, "before"));
+  store.ingestMessage(message("new", pn, 20, "after"));
+  const own = message("own", pn, 25, "mine");
+  own.key.fromMe = true;
+  store.ingestMessage(own);
+  store.ingestMessage(message("g", "1-2@g.us", 30, "group", { key: { id: "g", remoteJid: "1-2@g.us", participant: pn, fromMe: false } }));
+  assert.deepEqual(store.messagesSince({ sinceTimestamp: 10 }).map(m => m.id), ["new", "g"]);
+  assert.deepEqual(store.messagesSince({ sinceTimestamp: 10, includeFromMe: true }).map(m => m.id), ["new", "own", "g"]);
+  assert.deepEqual(store.messagesSince({ sinceTimestamp: 0, chatId: pn }).map(m => m.id), ["old", "new"]);
+});
+
+test("group participants are labelled with saved contact names", async t => {
+  const store = await fixture(t);
+  store.upsertContact({ id: pn, name: "Synthetic member" });
+  assert.equal(store.senderName({ participant: pn, pushName: "push label" }), "Synthetic member");
+  assert.equal(store.senderName({ participant: "10000000009@s.whatsapp.net", pushName: "push label" }), "push label");
+  assert.equal(store.senderName({ fromMe: true }), "me");
+});
+
+test("reactions attach to their target message instead of becoming chat messages", async t => {
+  const store = await fixture(t);
+  store.ingestMessage(message("target", pn, 10, "hello"));
+  const react = (id, text, fromMe = false) => ({ key: { id, remoteJid: pn, fromMe }, messageTimestamp: 11,
+    message: { reactionMessage: { key: { id: "target", remoteJid: pn, fromMe: false }, text } } });
+  store.ingestMessage(react("r1", "👍"));
+  store.ingestMessage(react("r2", "❤️", true));
+  assert.deepEqual(store.getMessages(pn).map(m => m.id), ["target"]);
+  assert.deepEqual(store.getMessages(pn)[0].reactions, { [pn]: "👍", me: "❤️" });
+  assert.equal(store.data.chats[pn].lastMessageText, "hello");
+  store.ingestMessage(react("r3", "", true));
+  assert.deepEqual(store.getMessages(pn)[0].reactions, { [pn]: "👍" });
+  store.ingestMessage({ ...react("r4", "🔥"), message: { reactionMessage: { key: { id: "uncached" }, text: "🔥" } } });
+  assert.equal(store.getMessageCount(pn), 1);
+});
+
+test("protocol edits and revokes update their target and replies record the quoted ID", async t => {
+  const store = await fixture(t);
+  store.ingestMessage(message("orig", pn, 10, "first draft"));
+  const protocol = (id, body) => ({ key: { id, remoteJid: pn, fromMe: false }, messageTimestamp: 12, message: { protocolMessage: body } });
+  store.ingestMessage(protocol("p1", { type: 14, key: { id: "orig", remoteJid: pn }, editedMessage: { conversation: "final text" } }));
+  let [entry] = store.getMessages(pn);
+  assert.equal(entry.text, "final text");
+  assert.ok(entry.editedAt);
+  assert.equal(store.data.chats[pn].lastMessageText, "final text");
+  store.ingestMessage({ key: { id: "reply", remoteJid: pn, fromMe: true }, messageTimestamp: 13,
+    message: { extendedTextMessage: { text: "answer", contextInfo: { stanzaId: "orig" } } } });
+  assert.equal(store.getMessages(pn).at(-1).replyTo, "orig");
+  store.ingestMessage(protocol("p2", { type: 0, key: { id: "orig", remoteJid: pn } }));
+  [entry] = store.getMessages(pn);
+  assert.equal(entry.messageType, "revoked");
+  assert.deepEqual(store.getMessages(pn).map(m => m.id), ["orig", "reply"]);
+});

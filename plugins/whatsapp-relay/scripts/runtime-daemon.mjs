@@ -1,0 +1,259 @@
+// The single owner of the live WhatsApp linked-device socket on this machine.
+// WhatsApp allows one live socket per linked device; every MCP worker (Codex
+// starts one per thread) proxies tool calls here instead of opening its own,
+// which would replace the others' connections (DisconnectReason.connectionReplaced).
+import fs from "node:fs";
+import net from "node:net";
+import path from "node:path";
+
+import { ControllerConfigStore } from "./controller-config.mjs";
+import { getControllerProcessStatus } from "./controller-process.mjs";
+import { ensureRuntimeDirs, runtimeDaemonLockFile, runtimeDaemonSocket, scriptsDir } from "./paths.mjs";
+import { WhatsAppRuntime } from "./runtime.mjs";
+import { DisconnectReason } from "@whiskeysockets/baileys";
+import { createWhatsAppService } from "./whatsapp-service.mjs";
+
+const WATCH_INTERVAL_MS = 5_000;
+const IDLE_EXIT_MS = Number(process.env.WHATSAPP_DAEMON_IDLE_MS ?? 10 * 60_000);
+const BRIDGE_HANDOVER_MS = 60_000;
+
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+// undefined: no lock file; null: unreadable (corrupt) lock file.
+function readLock() {
+  let text;
+  try {
+    text = fs.readFileSync(runtimeDaemonLockFile, "utf8");
+  } catch {
+    return undefined;
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+// The lock is written to a private file and hard-linked into place, so it
+// appears with its full contents; a racing daemon never reads it half-written
+// and mistakes it for a stale lock.
+function acquireLock() {
+  const draft = `${runtimeDaemonLockFile}.${process.pid}`;
+  fs.writeFileSync(draft, JSON.stringify({ pid: process.pid, socket: runtimeDaemonSocket, startedAt: new Date().toISOString() }), { mode: 0o600 });
+  try {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        fs.linkSync(draft, runtimeDaemonLockFile);
+        return true;
+      } catch (error) {
+        if (error.code !== "EEXIST") throw error;
+        const owner = readLock();
+        if (owner === undefined) continue;
+        if (owner && pidAlive(owner.pid)) return false;
+        fs.rmSync(runtimeDaemonLockFile, { force: true });
+      }
+    }
+    return false;
+  } finally {
+    fs.rmSync(draft, { force: true });
+  }
+}
+
+function scriptsVersion() {
+  let latest = 0;
+  for (const name of fs.readdirSync(scriptsDir)) {
+    if (name.endsWith(".mjs")) latest = Math.max(latest, fs.statSync(path.join(scriptsDir, name)).mtimeMs);
+  }
+  return latest;
+}
+
+await ensureRuntimeDirs();
+if (!acquireLock()) {
+  console.error(`runtime daemon already running (pid ${readLock()?.pid}); exiting`);
+  process.exit(0);
+}
+
+const runtime = new WhatsAppRuntime({ logLevel: process.env.WHATSAPP_LOG_LEVEL ?? "warn" });
+const controllerConfigStore = new ControllerConfigStore();
+await runtime.initialize();
+
+// While another process (bridge, QR CLI) holds the linked device, this daemon
+// must not reconnect: two sockets would keep replacing each other.
+let released = null; // { reason, ownerPid?, expiresAt? }
+let inFlight = 0;
+let lastActivity = Date.now();
+let shuttingDown = false;
+const bootVersion = scriptsVersion();
+
+function releasedReason() {
+  if (!released) return null;
+  const owner = released.ownerPid ? ` (pid ${released.ownerPid})` : "";
+  return `the live session was handed to another process${owner}: ${released.reason}`;
+}
+
+async function bridgeOwnsSession() {
+  const [config, status] = await Promise.all([controllerConfigStore.load(), getControllerProcessStatus()]);
+  return config.enabled && status.running;
+}
+
+async function release({ ownerPid, reason = "released", ttlMs } = {}) {
+  released = { reason, ownerPid, expiresAt: ttlMs ? Date.now() + ttlMs : undefined };
+  await runtime.stop();
+}
+
+const service = createWhatsAppService({
+  runtime,
+  controllerConfigStore,
+  mode: "daemon",
+  session: {
+    blockedReason: releasedReason,
+    async beforeBridgeStart() {
+      await release({ reason: "controller_bridge_starting", ttlMs: BRIDGE_HANDOVER_MS });
+    },
+    afterBridgeStart(processStatus) {
+      if (processStatus?.pid) released = { reason: "controller_bridge", ownerPid: processStatus.pid };
+    },
+    async afterBridgeStop() {
+      released = null;
+      await autoConnect();
+    },
+    async reconnect() {
+      released = null;
+    }
+  }
+});
+
+function canAutoConnect() {
+  const code = runtime.state.lastDisconnect?.code;
+  return runtime.hasSavedCreds() && !released &&
+    !["connected", "connecting", "awaiting_qr_scan"].includes(runtime.state.status) &&
+    !(runtime.state.status === "disconnected" && code === DisconnectReason.connectionReplaced) &&
+    runtime.state.status !== "logged_out";
+}
+
+async function autoConnect() {
+  if (!canAutoConnect() || await bridgeOwnsSession()) return;
+  runtime.start().catch(error => console.error(`[${new Date().toISOString()}] auto-connect failed: ${error.message}`));
+}
+
+async function shutdown(reason) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.error(`[${new Date().toISOString()}] runtime daemon exiting: ${reason}`);
+  server.close();
+  try { await runtime.stop(); } catch {}
+  try { await runtime.historyRequests.writes; } catch {}
+  // A daemon that lost the lock must not delete the winner's socket.
+  if (readLock()?.pid === process.pid) {
+    fs.rmSync(runtimeDaemonLockFile, { force: true });
+    if (ownsSocket()) fs.rmSync(runtimeDaemonSocket, { force: true });
+  }
+  process.exit(0);
+}
+
+async function handle(request) {
+  switch (request.method) {
+    case "call": {
+      lastActivity = Date.now();
+      inFlight += 1;
+      try {
+        return await service.call(request.params?.name, request.params?.args ?? {});
+      } finally {
+        inFlight -= 1;
+        lastActivity = Date.now();
+      }
+    }
+    case "status":
+      return { pid: process.pid, ...runtime.summary(), released, inFlight };
+    case "release":
+      await release(request.params ?? {});
+      return { released };
+    case "shutdown":
+      setImmediate(() => shutdown("shutdown requested"));
+      return { ok: true };
+    default:
+      throw new Error(`Unknown method ${request.method}`);
+  }
+}
+
+const server = net.createServer(connection => {
+  let buffer = "";
+  connection.setEncoding("utf8");
+  connection.on("error", () => {});
+  connection.on("data", async chunk => {
+    buffer += chunk;
+    const newline = buffer.indexOf("\n");
+    if (newline < 0) return;
+    const line = buffer.slice(0, newline);
+    buffer = "";
+    let request;
+    try {
+      request = JSON.parse(line);
+    } catch {
+      connection.end(`${JSON.stringify({ id: null, error: { message: "Malformed request" } })}\n`);
+      return;
+    }
+    try {
+      const result = await handle(request);
+      connection.end(`${JSON.stringify({ id: request.id, result })}\n`);
+    } catch (error) {
+      connection.end(`${JSON.stringify({ id: request.id, error: { message: error.message } })}\n`);
+    }
+  });
+});
+
+let socketInode = null;
+function ownsSocket() {
+  try {
+    return fs.statSync(runtimeDaemonSocket).ino === socketInode;
+  } catch {
+    return false;
+  }
+}
+
+fs.rmSync(runtimeDaemonSocket, { force: true });
+await new Promise((resolve, reject) => {
+  server.once("error", reject);
+  server.listen(runtimeDaemonSocket, () => {
+    fs.chmodSync(runtimeDaemonSocket, 0o600);
+    socketInode = fs.statSync(runtimeDaemonSocket).ino;
+    resolve();
+  });
+});
+console.error(`[${new Date().toISOString()}] runtime daemon ${process.pid} listening on ${runtimeDaemonSocket}`);
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+
+await autoConnect();
+
+const watcher = setInterval(async () => {
+  try {
+    if (readLock()?.pid !== process.pid) return shutdown("lock file removed or taken over");
+    // Workers connect by path; if another process replaced the socket file,
+    // exit so the next call starts a daemon that owns both lock and socket.
+    if (!ownsSocket()) return shutdown("socket file removed or replaced");
+    if (released?.ownerPid && !pidAlive(released.ownerPid)) released = null;
+    if (released?.expiresAt && Date.now() > released.expiresAt) released = null;
+    if (await bridgeOwnsSession()) {
+      if (runtime.socket) await runtime.stop();
+      await runtime.store.load();
+    } else {
+      await autoConnect();
+    }
+    if (inFlight === 0 && scriptsVersion() !== bootVersion) return shutdown("relay scripts changed; the next call starts the new version");
+    if (!runtime.hasSavedCreds() && inFlight === 0 && Date.now() - lastActivity > IDLE_EXIT_MS) return shutdown("idle without credentials");
+  } catch (error) {
+    console.error(`[${new Date().toISOString()}] watcher error: ${error.message}`);
+  }
+}, WATCH_INTERVAL_MS);
+// The listening server keeps the process alive, not the watcher.
+watcher.unref?.();

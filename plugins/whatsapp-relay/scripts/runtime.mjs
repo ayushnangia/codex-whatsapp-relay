@@ -157,6 +157,8 @@ export class WhatsAppRuntime {
 
   async initialize() {
     await ensureRuntimeDirs();
+    // Never discard this process's own pending writes when reloading from disk.
+    await this.store.flush();
     await this.store.load();
     await this.historyRequests.load();
   }
@@ -185,6 +187,7 @@ export class WhatsAppRuntime {
       return this.socket;
     }
 
+    this.closing = false;
     this.startPromise = this.#startInternal({ printQrToTerminal }).finally(() => {
       this.startPromise = null;
     });
@@ -369,6 +372,21 @@ export class WhatsAppRuntime {
     });
 
     return socket;
+  }
+
+  // Release the live WhatsApp socket without logging out, so another owner
+  // (the controller bridge or a QR flow) can take over the linked device.
+  async stop() {
+    this.closing = true;
+    const socket = this.socket;
+    this.socket = null;
+    try {
+      socket?.end?.(undefined);
+    } catch {}
+    this.state.status = "idle";
+    this.state.currentQrText = null;
+    await this.store.flush();
+    this.closing = false;
   }
 
   on(eventName, listener) {

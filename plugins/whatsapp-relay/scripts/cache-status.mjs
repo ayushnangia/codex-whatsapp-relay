@@ -13,7 +13,7 @@ export function cacheStatusLines({ status, hasCreds, sessionOwner, pid = process
     ...(live ? [] : [sessionOwner === "controller_bridge"
       ? "next_step: inspect the existing controller bridge connection; do not open a second direct socket"
       : hasCreds
-      ? "next_step: use whatsapp_start_auth once to reconnect saved credentials after checking session ownership; cached lookup does not reconnect automatically"
+      ? "next_step: call whatsapp_reconnect to reopen the saved session (no QR code); live tools also reconnect on demand"
       : "next_step: authentication is required before live synchronization"])
   ];
 }

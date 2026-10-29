@@ -51,31 +51,38 @@ Use this skill when the user wants to connect WhatsApp, inspect recent chats, re
    While the bridge is running, treat it as the sole owner of the live WhatsApp session. Prefer cached reads from MCP tools and route outbound messages through the bridge instead of reconnecting a second socket.
    If the allowed controller is the same WhatsApp account linked to the plugin, the self chat can be used as the control surface and should be treated as a valid source of prompts.
 
+## Headless use (no WhatsApp UI)
+
+Use these tools instead of opening WhatsApp Web, the desktop app or a browser:
+
+| Need | Tool |
+| --- | --- |
+| Find a chat, group or contact by name or phone number | `whatsapp_list_chats` (`query`, `kind`) |
+| Find a message by its content | `whatsapp_search_messages` |
+| Read a conversation | `whatsapp_read_messages` |
+| Wait for a reply or new messages | `whatsapp_wait_for_messages` (pass back `next_since_timestamp`) |
+| Message someone who is not in the cache | `whatsapp_check_number`, then `whatsapp_send_message` with `phoneNumber` |
+| Reply to a specific message | `whatsapp_send_message` with `replyToMessageId` |
+| React, edit, delete, forward | `whatsapp_react`, `whatsapp_edit_message`, `whatsapp_delete_message`, `whatsapp_forward_message` |
+| Polls and locations | `whatsapp_send_poll`, `whatsapp_send_location` |
+| Mark read | `whatsapp_mark_read` |
+| Who is in a group, a contact's About | `whatsapp_group_info`, `whatsapp_contact_info` |
+| Session dropped or replaced | `whatsapp_reconnect` |
+
+All MCP workers share one runtime daemon that owns the live socket, so parallel Codex threads do not disconnect each other. If a result says `runtime_mode: cache_only`, the daemon is unreachable: reads still work from the cache, but sends are refused; check `runtime-daemon.log` in the data directory.
+
 ## Local state
 
- - Auth credentials: `plugins/whatsapp-relay/data/auth*`
+- Auth credentials: `plugins/whatsapp-relay/data/auth*`
 - Chat cache: `plugins/whatsapp-relay/data/store.json`
+- Runtime daemon: `plugins/whatsapp-relay/data/runtime-daemon.json` (lock) and `runtime-daemon.log`
 
 ## Rules
 
-- Saved credentials do not imply a live connection. Check auth and controller
-  status when lookup is empty or stale. An idle MCP reads an old cache until the
-  saved session is reconnected; use `whatsapp_start_auth` once only after checking
-  that no bridge or other MCP worker already owns the live session. Do not relink
-  or open another socket to work around an existing owner.
-- A queried result marked `contact_only` identifies a cached direct contact, not
-  a synchronized conversation. Missing history does not prove that the contact
-  or messages are absent on the phone. Keep duplicate names ambiguous and use a
-  verified recipient ID when available; never guess from a group-name match.
-- Native UI labels and received contact labels can differ. Search distinctive
-  name components and review all candidates before selecting a direct recipient.
-  Explain a concrete connector blocker before considering a UI fallback.
-- A connected socket and a recent cache write do not prove newest-phone history
-  completeness. On-demand history sync fetches messages older than its anchor.
-  Reconcile existing message IDs and delivery evidence; never resend a message
-  merely because the cache or its receipts are incomplete.
 - Do not guess a chat if multiple names match. List candidates first.
-- If the user asks for older messages that are not in the local cache yet, use `whatsapp_sync_history` before concluding the history is unavailable.
+- Never use the WhatsApp UI or a browser for something a tool above can do.
+- A tool result of `outcome: unknown` means the message may have been sent: check with `whatsapp_read_messages` before retrying.
+- If the user asks for older messages that are not in the local cache yet, use `whatsapp_search_messages` and `whatsapp_sync_history` before concluding the history is unavailable.
 - Keep outbound messages short and explicit when the user asks you to send one.
 - If the user only wants a draft, do not call the send tool.
 - Keep `npm run whatsapp:auth` as a local fallback, not the primary path.

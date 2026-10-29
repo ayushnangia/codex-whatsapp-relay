@@ -4,7 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-- Search direct contacts before their conversation history arrives, preserve duplicate-name ambiguity, prefer human contact labels over masked phone placeholders, and expose disconnected-cache recovery steps without treating missing cache entries as absent phone conversations.
+### Fixed — headless reliability
+
+- One runtime daemon now owns the live WhatsApp socket per data directory. Codex starts one MCP worker per thread, and each worker used to open its own linked-device socket; every send, download or sync replaced the others' connections (`connectionReplaced`), never reconnected, and left most workers serving a stale cache. Workers are now thin proxies over a private Unix socket and start the daemon on demand. `WHATSAPP_DAEMON=off` restores in-process mode.
+- `connectionReplaced` and `logged_out` sessions report a clear `next_step` instead of a generic error; the new `whatsapp_reconnect` reopens the saved session without a QR code.
+- The controller bridge, the terminal QR flow and `npm run whatsapp:status` hand the session over to, or query, the daemon instead of opening a competing socket. The daemon resumes automatically when they exit.
+- Cache reads reload from disk unless this process holds the live socket, so a worker never answers from a days-old in-memory snapshot.
+- Name lookup is accent-, case- and word-order-insensitive, matches phone numbers in any format, and reports `no_cached_match` with next steps instead of a dead end.
+- Protocol edits and revokes update their target message; replies record the quoted message ID; group senders show their saved names.
+
+### Added — features that work without the WhatsApp UI
+
+- `whatsapp_search_messages` (full-text across chats), `whatsapp_wait_for_messages` (long-poll for new messages with a cursor).
+- Send to a `phoneNumber` (verified on WhatsApp first) and reply with `replyToMessageId` in `whatsapp_send_message` / `whatsapp_send_media`.
+- `whatsapp_react`, `whatsapp_edit_message`, `whatsapp_delete_message`, `whatsapp_forward_message`, `whatsapp_mark_read`, `whatsapp_send_poll`, `whatsapp_send_location`.
+- `whatsapp_check_number`, `whatsapp_contact_info`, `whatsapp_group_info` (participants, admins; lists all groups without arguments).
+- `whatsapp_list_chats` filters by `kind` (direct or group); results show replies, reactions and edits.
+- The optional final-send confirmation toggle covers every new sending tool; new read-only tools are auto-approved.
 
 - Apply the optional final-send confirmation toggle to separately named official Slack MCP connections, without changing their authentication or enabled state.
 

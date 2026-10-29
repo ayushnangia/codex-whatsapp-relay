@@ -1,4 +1,6 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -19,6 +21,16 @@ export const controllerLogFile = path.join(dataDir, "controller.log");
 export const controllerOutboxDir = path.join(dataDir, "controller-outbox");
 export const controllerOutboxFailedDir = path.join(dataDir, "controller-outbox.failed");
 export const controllerDaemonScript = path.join(scriptDir, "controller-daemon.mjs");
+export const scriptsDir = scriptDir;
+export const runtimeDaemonScript = path.join(scriptDir, "runtime-daemon.mjs");
+export const runtimeDaemonLockFile = path.join(dataDir, "runtime-daemon.json");
+export const runtimeDaemonLogFile = path.join(dataDir, "runtime-daemon.log");
+// macOS limits Unix socket paths to 104 bytes; long data directories fall back
+// to a per-directory name in the private temporary directory.
+const preferredSocket = path.join(dataDir, "runtime.sock");
+export const runtimeDaemonSocket = Buffer.byteLength(preferredSocket) < 100
+  ? preferredSocket
+  : path.join(os.tmpdir(), `whatsapp-relay-${createHash("sha256").update(dataDir).digest("hex").slice(0, 16)}.sock`);
 export const globalControllerOwnerFile = path.join(
   process.env.HOME ?? repoRoot,
   ".codex",

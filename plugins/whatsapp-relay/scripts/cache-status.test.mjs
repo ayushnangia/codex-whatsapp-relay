@@ -6,7 +6,8 @@ test("idle caches expose a saved-session reconnect action without claiming absen
   const text = cacheStatusLines({ status: "idle", hasCreds: true, pid: 123 }, { updatedAt: "2020-01-01" }).join("\n");
   assert.match(text, /sync_state: cache_only_disconnected/);
   assert.match(text, /cache_updated_at: 2020-01-01/);
-  assert.match(text, /whatsapp_start_auth/);
+  assert.match(text, /whatsapp_reconnect/);
+  assert.doesNotMatch(text, /whatsapp_start_auth/);
   assert.match(text, /history_completeness: not_verified/);
   assert.match(missingHistoryHint, /does not prove it is absent/);
 });

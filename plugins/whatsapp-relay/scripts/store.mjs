@@ -170,8 +170,28 @@ export function extractAudioMessage(message) {
   return payload.audioMessage;
 }
 
+// Fold accents and invisible formatting so "jose" finds "José" and pasted
+// names with zero-width or non-breaking spaces still match.
 function normalizedName(value) {
-  return String(value ?? "").normalize("NFKC").replace(/\p{Cf}/gu, "").replace(/\s+/gu, " ").trim().toLowerCase();
+  return String(value ?? "").normalize("NFKD").replace(/\p{M}/gu, "").normalize("NFKC")
+    .replace(/\p{Cf}/gu, "").replace(/\s+/gu, " ").trim().toLowerCase();
+}
+
+function matchesTokens(haystack, query) {
+  return query.split(" ").every(token => haystack.includes(token));
+}
+
+// A query made only of phone punctuation with at least seven digits is a phone
+// lookup. Leading trunk zeros are dropped so local formats match by suffix.
+export function queryPhoneDigits(value) {
+  const text = String(value ?? "").trim();
+  if (!/^[+\d\s().-]+$/.test(text)) return null;
+  const digits = text.replace(/\D/g, "").replace(/^0+/, "");
+  return digits.length >= 7 ? digits : null;
+}
+
+function jidDigits(jid) {
+  return /@s\.whatsapp\.net$/.test(jid ?? "") ? jid.split("@")[0].split(":")[0] : null;
 }
 
 function preferredChatName(chat, contact) {
@@ -239,6 +259,15 @@ export class WhatsAppStore {
     });
     this.savePromise = write;
     return write;
+  }
+
+  async flush() {
+    if (this.pendingSave) {
+      clearTimeout(this.pendingSave);
+      this.pendingSave = null;
+      await this.save();
+    }
+    await this.savePromise.catch(() => {});
   }
 
   scheduleSave() {
@@ -419,6 +448,24 @@ export class WhatsAppStore {
       return;
     }
 
+    const reaction = unwrapMessage(message.message)?.reactionMessage;
+    if (reaction) {
+      this.applyReaction(remoteJid, reaction, message.key);
+      return;
+    }
+
+    // Edits and revokes are envelopes about another message, never chat content.
+    const protocol = unwrapMessage(message.message)?.protocolMessage;
+    if (protocol) {
+      const target = { remoteJid: key.remoteJid, id: protocol.key?.id, fromMe: protocol.key?.fromMe };
+      if (protocol.type === proto.Message.ProtocolMessage.Type.REVOKE) {
+        this.updateMessage(target, { messageStubType: proto.WebMessageInfo.StubType.REVOKE });
+      } else if (protocol.type === proto.Message.ProtocolMessage.Type.MESSAGE_EDIT && protocol.editedMessage) {
+        this.applyEdit(remoteJid, protocol.key?.id, extractMessageText(protocol.editedMessage));
+      }
+      return;
+    }
+
     const timestamp = normalizeTimestamp(message.messageTimestamp);
     const messageEntry = {
       id: message.key?.id ?? `${remoteJid}:${timestamp ?? Date.now()}`,
@@ -431,6 +478,8 @@ export class WhatsAppStore {
       messageType: extractMessageType(message.message)
     };
     if (message.status !== undefined) messageEntry.deliveryStatus = message.status;
+    const contextInfo = Object.values(unwrapMessage(message.message) ?? {}).find(value => value?.contextInfo)?.contextInfo;
+    if (contextInfo?.stanzaId) messageEntry.replyTo = contextInfo.stanzaId;
     if (message.message) {
       messageEntry.rawMessage = proto.WebMessageInfo.toObject(proto.WebMessageInfo.fromObject(message), {
         bytes: String, longs: String
@@ -519,6 +568,27 @@ export class WhatsAppStore {
     this.scheduleSave();
   }
 
+  applyEdit(chatId, messageId, text) {
+    const target = (this.data.messages[chatId] ?? []).find(entry => entry.id === messageId);
+    if (!target) return;
+    target.text = text;
+    target.editedAt = new Date().toISOString();
+    const chat = this.data.chats[chatId];
+    if (chat?.lastMessageId === messageId) chat.lastMessageText = text;
+    this.scheduleSave();
+  }
+
+  // Reactions are state on the target message; an uncached target is ignored.
+  applyReaction(chatId, reaction, senderKey = {}) {
+    const target = (this.data.messages[chatId] ?? []).find(entry => entry.id === reaction.key?.id);
+    if (!target) return;
+    const sender = senderKey.fromMe ? "me" : this.canonicalJid(senderKey.participant ?? chatId);
+    const reactions = { ...target.reactions };
+    if (reaction.text) reactions[sender] = reaction.text; else delete reactions[sender];
+    if (Object.keys(reactions).length) target.reactions = reactions; else delete target.reactions;
+    this.scheduleSave();
+  }
+
   contactCandidate(id) {
     id = this.canonicalJid(id);
     const contact = this.data.contacts[id];
@@ -529,6 +599,7 @@ export class WhatsAppStore {
 
   listChats({ limit = 20, query, unreadOnly = false } = {}) {
     const normalizedQuery = normalizedName(query);
+    const phoneQuery = queryPhoneDigits(query);
     const entries = new Map(Object.values(this.data.chats).map(chat => [chat.id, {
       ...chat, cacheEntryKind: "cached_chat", cachedMessageCount: this.getMessageCount(chat.id)
     }]));
@@ -552,6 +623,11 @@ export class WhatsAppStore {
           return true;
         }
 
+        if (phoneQuery) {
+          const contact = this.data.contacts[chat.id];
+          return [chat.id, contact?.phoneNumber, contact?.id].some(jid => jidDigits(jid)?.endsWith(phoneQuery));
+        }
+
         const haystack = [
           chat.id,
           chat.displayName,
@@ -566,7 +642,7 @@ export class WhatsAppStore {
           .map(normalizedName)
           .join(" ");
 
-        return haystack.includes(normalizedQuery);
+        return matchesTokens(haystack, normalizedQuery);
       })
       .sort(
         (a, b) =>
@@ -575,6 +651,41 @@ export class WhatsAppStore {
       );
 
     return chats.slice(0, limit);
+  }
+
+  chatName(chatId) {
+    chatId = this.canonicalJid(chatId);
+    const chat = this.data.chats[chatId];
+    return chat ? preferredChatName(chat, this.data.contacts[chatId]) : this.contactCandidate(chatId)?.displayName ?? chatId;
+  }
+
+  senderName(entry) {
+    if (entry.fromMe) return "me";
+    const jid = entry.participant ?? (entry.chatId?.endsWith("@g.us") ? null : entry.chatId);
+    const contact = jid ? this.data.contacts[this.canonicalJid(jid)] : null;
+    return contact?.name || entry.pushName || contact?.notify || contact?.verifiedName || jid || "contact";
+  }
+
+  #annotate(entry) {
+    return { ...withReceiptEvidence(entry), chatName: this.chatName(entry.chatId), senderName: this.senderName(entry) };
+  }
+
+  // Cached full-text search. Newest first; it only covers what this device has cached.
+  searchMessages({ query, chatId, limit = 20, sinceTimestamp } = {}) {
+    const folded = normalizedName(query);
+    if (!folded) return [];
+    const chatIds = chatId ? [this.canonicalJid(chatId)] : Object.keys(this.data.messages);
+    const hits = chatIds.flatMap(id => (this.data.messages[id] ?? []).filter(entry =>
+      (!sinceTimestamp || (entry.timestamp ?? 0) > sinceTimestamp) && matchesTokens(normalizedName(entry.text), folded)));
+    return hits.sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0)).slice(0, limit).map(entry => this.#annotate(entry));
+  }
+
+  // Oldest first so a caller can advance its cursor to the last returned timestamp.
+  messagesSince({ sinceTimestamp = 0, chatId, includeFromMe = false, limit = 100 } = {}) {
+    const chatIds = chatId ? [this.canonicalJid(chatId)] : Object.keys(this.data.messages);
+    return chatIds.flatMap(id => (this.data.messages[id] ?? []).filter(entry =>
+      (entry.timestamp ?? 0) > sinceTimestamp && (includeFromMe || !entry.fromMe)))
+      .sort((a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0)).slice(0, limit).map(entry => this.#annotate(entry));
   }
 
   getMessages(chatId, limit = 20) {
